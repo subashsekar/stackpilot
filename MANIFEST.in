@@ -1,0 +1,21 @@
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include README.md
+include FAQ.md
+recursive-include tests *
+recursive-include examples *
+global-exclude *.py[cod] *.pyo *.pyd __pycache__ .DS_Store Thumbs.db *.swp *~ *.log *.tmp
+prune **/__pycache__
+prune **/.pytest_cache
+prune **/.mypy_cache
+prune **/.ruff_cache
+prune **/.venv
+prune **/venv
+prune **/node_modules
+prune **/.stackpilot
+prune **/.vscode
+prune **/.idea
+prune **/coverage
+prune **/htmlcov

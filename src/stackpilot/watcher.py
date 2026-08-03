@@ -1,0 +1,450 @@
+"""Per-service filesystem watcher with debounced change detection."""
+
+from __future__ import annotations
+
+import sys
+import threading
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+from watchdog.events import (
+    FileSystemEvent,
+    FileSystemEventHandler,
+    FileSystemMovedEvent,
+)
+from watchdog.observers import Observer
+
+from .ignore import IgnoreMatcher
+
+DEFAULT_DEBOUNCE_S = 0.3
+
+# (service_name, changed_paths) — paths are absolute strings.
+ChangeCallback = Callable[[str, Sequence[str]], None]
+FileSignature = Tuple[int, int]  # (mtime_ns, size)
+
+# uvicorn --reload* flags that take a following value.
+_RELOAD_FLAGS_WITH_VALUE = frozenset(
+    {
+        "--reload-dir",
+        "--reload-dirs",
+        "--reload-delay",
+        "--reload-include",
+        "--reload-exclude",
+    }
+)
+
+
+def _command_tokens(command: str | Sequence[str]) -> list[str]:
+    if isinstance(command, (list, tuple)):
+        return [str(part) for part in command]
+    text = str(command).strip()
+    if not text:
+        return []
+    try:
+        from .utils import _split_command_text
+
+        return _split_command_text(text)
+    except ValueError:
+        return text.split()
+
+
+def has_uvicorn_reload_flag(command: str | Sequence[str]) -> bool:
+    """True when argv/command includes uvicorn-style ``--reload``."""
+
+    for token in _command_tokens(command):
+        lower = token.lower()
+        if lower == "--reload" or lower.startswith("--reload="):
+            return True
+        if lower in _RELOAD_FLAGS_WITH_VALUE:
+            return True
+        if any(lower.startswith(f"{flag}=") for flag in _RELOAD_FLAGS_WITH_VALUE):
+            return True
+    return False
+
+
+def has_django_runserver(command: str | Sequence[str]) -> bool:
+    """True when ``command`` launches Django's ``runserver``."""
+
+    tokens = _command_tokens(command)
+    lowered = [t.lower() for t in tokens]
+    for index, token in enumerate(lowered):
+        if token != "runserver":
+            continue
+        if index == 0:
+            return True
+        prev = lowered[index - 1].replace("\\", "/").rsplit("/", 1)[-1]
+        if prev == "manage.py" or prev in {"django", "django-admin"}:
+            return True
+    return False
+
+
+def django_runserver_has_autoreload(command: str | Sequence[str]) -> bool:
+    """True when Django ``runserver`` would enable StatReloader."""
+
+    if not has_django_runserver(command):
+        return False
+    lowered = [t.lower() for t in _command_tokens(command)]
+    return "--noreload" not in lowered
+
+
+def should_takeover_native_reload(command: str | Sequence[str]) -> bool:
+    """
+    True when StackPilot must own reload instead of the framework.
+
+    On Windows, uvicorn ``--reload`` sends ``CTRL_C_EVENT`` to restart the
+    worker; that console signal interrupts the StackPilot parent and shuts
+    down the whole stack. Django ``runserver`` autoreload is also taken over
+    on Windows so StackPilot can restart the full process on file changes
+    (failed Django reloads can leave a dead server thread while the parent
+    stays "alive").
+    """
+
+    if sys.platform != "win32":
+        return False
+    if has_uvicorn_reload_flag(command):
+        return True
+    return django_runserver_has_autoreload(command)
+
+
+def strip_native_reload_argv(argv: Sequence[str]) -> list[str]:
+    """Disable framework-native reload so StackPilot can own restarts."""
+
+    out: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        lower = token.lower()
+        if lower == "--reload" or lower.startswith("--reload="):
+            continue
+        if lower in _RELOAD_FLAGS_WITH_VALUE:
+            skip_next = True
+            continue
+        if any(lower.startswith(f"{flag}=") for flag in _RELOAD_FLAGS_WITH_VALUE):
+            continue
+        out.append(token)
+
+    # Django runserver autoreloads by default; disable it for takeover.
+    if django_runserver_has_autoreload(out):
+        out.append("--noreload")
+    return out
+
+
+def has_native_reload(command: str | Sequence[str]) -> bool:
+    """
+    Return True when ``command`` already enables framework-native reload.
+
+    Detects patterns such as ``uvicorn ... --reload``, Django ``runserver``,
+    and ``flask --debug``.
+    """
+
+    tokens = _command_tokens(command)
+    lowered = [t.lower() for t in tokens]
+    if not lowered:
+        return False
+
+    if has_uvicorn_reload_flag(tokens):
+        return True
+
+    if django_runserver_has_autoreload(tokens):
+        return True
+
+    # flask --debug / flask run --debug
+    if "flask" in lowered and "--debug" in lowered:
+        return True
+
+    # Common env-style debug launchers embedded in the command string.
+    joined = " ".join(lowered)
+    if "flask" in lowered and ("flask_debug=1" in joined or "flask_env=development" in joined):
+        return True
+
+    return False
+
+
+def format_changed_paths(
+    paths: Sequence[str | Path],
+    *,
+    relative_to: Path | None = None,
+) -> str:
+    """Format changed paths as ``'folder/file.py'`` for reload messages."""
+
+    labels: List[str] = []
+    root = relative_to.expanduser().resolve() if relative_to is not None else None
+    for raw in paths:
+        path = Path(raw)
+        label: str
+        if root is not None:
+            try:
+                label = path.resolve().relative_to(root).as_posix()
+            except (ValueError, OSError):
+                # Fall back to parent/name so we still show a folder when possible.
+                try:
+                    label = f"{path.parent.name}/{path.name}"
+                except Exception:
+                    label = path.name
+        else:
+            try:
+                label = f"{path.parent.name}/{path.name}"
+            except Exception:
+                label = path.name
+        if label not in labels:
+            labels.append(label)
+    if not labels:
+        return "'<unknown>'"
+    return ", ".join(f"'{label}'" for label in labels)
+
+
+class ServiceWatcher:
+    """
+    Watch one service's directories and invoke ``on_change`` after debounce.
+
+    Detects create, modify, delete, and rename events. Ignored paths never
+    schedule a restart.
+    """
+
+    def __init__(
+        self,
+        service_name: str,
+        watch_dirs: Sequence[Path],
+        on_change: ChangeCallback,
+        *,
+        debounce_s: float = DEFAULT_DEBOUNCE_S,
+        ignore: Optional[IgnoreMatcher] = None,
+        observer: Optional[Observer] = None,
+    ) -> None:
+        self.service_name = service_name
+        self._watch_dirs = [Path(d).expanduser().resolve() for d in watch_dirs]
+        self._on_change = on_change
+        self._debounce_s = max(0.0, float(debounce_s))
+        self._ignore = ignore
+        self._observer = observer or Observer()
+        self._owns_observer = observer is None
+        self._handler = _DebouncedHandler(
+            service_name=service_name,
+            on_change=on_change,
+            debounce_s=self._debounce_s,
+            ignore=ignore,
+        )
+        self._started = False
+
+    @property
+    def watch_dirs(self) -> Sequence[Path]:
+        return tuple(self._watch_dirs)
+
+    @property
+    def handler(self) -> "_DebouncedHandler":
+        """Expose the event handler for unit tests."""
+
+        return self._handler
+
+    def start(self) -> None:
+        if self._started:
+            return
+        for directory in self._watch_dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+            self._handler.prime(directory)
+            self._observer.schedule(self._handler, str(directory), recursive=True)
+        if self._owns_observer:
+            self._observer.start()
+        self._started = True
+
+    def stop(self) -> None:
+        self._handler.cancel()
+        if not self._started:
+            return
+        if self._owns_observer:
+            self._observer.stop()
+            self._observer.join(timeout=5.0)
+        self._started = False
+
+    def notify_for_tests(self, path: Path, *, event_type: str = "modified") -> None:
+        """Synthesize a filesystem event (used by unit tests)."""
+
+        self._handler.handle_path(path, event_type=event_type)
+
+
+class _DebouncedHandler(FileSystemEventHandler):
+    """Accumulate filesystem events and fire once after a quiet period."""
+
+    def __init__(
+        self,
+        *,
+        service_name: str,
+        on_change: ChangeCallback,
+        debounce_s: float,
+        ignore: Optional[IgnoreMatcher],
+    ) -> None:
+        super().__init__()
+        self._service_name = service_name
+        self._on_change = on_change
+        self._debounce_s = debounce_s
+        self._ignore = ignore
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._pending = False
+        self._pending_paths: Set[str] = set()
+        self._signatures: Dict[str, FileSignature] = {}
+        self.fire_count = 0
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._consider(event.src_path, event_type="created", is_directory=event.is_directory)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        # Directory "modified" events are noisy on some platforms (especially
+        # Windows) when a child file changes; only act on file modifications.
+        if event.is_directory:
+            return
+        self._consider(event.src_path, event_type="modified", is_directory=False)
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        self._consider(event.src_path, event_type="deleted", is_directory=event.is_directory)
+
+    def on_moved(self, event: FileSystemMovedEvent) -> None:
+        self._consider(event.src_path, event_type="moved", is_directory=event.is_directory)
+        dest = getattr(event, "dest_path", None)
+        if dest:
+            self._consider(dest, event_type="moved", is_directory=event.is_directory)
+
+    def handle_path(self, path: Path | str, *, event_type: str = "modified") -> None:
+        """Test helper: feed a path through the same ignore + debounce path."""
+
+        self._consider(str(path), event_type=event_type, is_directory=False)
+
+    def prime(self, root: Path) -> None:
+        """Capture a baseline of existing files so open/focus noise won't reload."""
+
+        try:
+            iterator = root.rglob("*")
+        except OSError:
+            return
+
+        for path in iterator:
+            if not path.is_file() or self._should_ignore(path):
+                continue
+            sig = self._signature(path)
+            if sig is not None:
+                self._signatures[str(path.resolve())] = sig
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending = False
+            self._pending_paths.clear()
+
+    def _consider(self, raw_path: str, *, event_type: str, is_directory: bool) -> None:
+        if event_type in {"opened", "closed", "closed_no_write"}:
+            return
+        if is_directory:
+            if event_type == "deleted":
+                self._forget_tree(Path(raw_path))
+                self._schedule(str(Path(raw_path)))
+            return
+        path = Path(raw_path)
+        if self._should_ignore(path):
+            return
+        if not self._is_real_change(path, event_type=event_type):
+            return
+        self._schedule(str(path))
+
+    def _is_real_change(self, path: Path, *, event_type: str) -> bool:
+        key = str(path.resolve())
+        if event_type == "deleted":
+            existed = key in self._signatures
+            self._forget_tree(path)
+            return existed
+
+        sig = self._signature(path)
+        if sig is None:
+            return False
+
+        old = self._signatures.get(key)
+        self._signatures[key] = sig
+        if event_type in {"created", "moved"}:
+            return old != sig
+        if event_type == "modified":
+            return old != sig
+        return True
+
+    def _forget_tree(self, path: Path) -> None:
+        """Drop signatures for ``path`` and every recorded descendant."""
+
+        try:
+            target = path.resolve()
+        except OSError:
+            target = Path(path)
+
+        for key in list(self._signatures):
+            try:
+                key_path = Path(key).resolve()
+            except OSError:
+                key_path = Path(key)
+            try:
+                if key_path == target or target in key_path.parents:
+                    self._signatures.pop(key, None)
+            except (ValueError, OSError):
+                if key == str(target):
+                    self._signatures.pop(key, None)
+
+    def _signature(self, path: Path) -> Optional[FileSignature]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _should_ignore(self, path: Path) -> bool:
+        # Editing the ignore file should not restart the service.
+        if path.name == ".stackpilotignore":
+            return True
+
+        if self._ignore is not None:
+            return self._ignore.ignored(path)
+
+        # Fallback: skip common junk when no matcher was provided.
+        parts = {p.lower() for p in path.parts}
+        for name in (
+            ".git",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            "node_modules",
+            ".venv",
+            ".logs",
+            ".stackpilot",
+            "dist",
+            "build",
+        ):
+            if name in parts:
+                return True
+        if path.suffix.lower() in {".pyc", ".pyo", ".log"}:
+            return True
+        return False
+
+    def _schedule(self, path: str) -> None:
+        with self._lock:
+            self._pending = True
+            self._pending_paths.add(path)
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = threading.Timer(self._debounce_s, self._fire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if not self._pending:
+                return
+            self._pending = False
+            self._timer = None
+            paths = tuple(sorted(self._pending_paths))
+            self._pending_paths.clear()
+            self.fire_count += 1
+        try:
+            self._on_change(self._service_name, paths)
+        except Exception:
+            # Never let callback failures kill the observer thread.
+            pass

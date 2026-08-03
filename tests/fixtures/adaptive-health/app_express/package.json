@@ -1,0 +1,12 @@
+{
+  "name": "adaptive-health-express",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  }
+}

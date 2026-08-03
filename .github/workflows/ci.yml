@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Twine check
+        run: python -m twine check dist/*
+
+      - name: Verify artifact contents
+        run: |
+          python - <<'PY'
+          import tarfile, zipfile
+          from pathlib import Path
+
+          dist = Path("dist")
+          sdists = list(dist.glob("*.tar.gz"))
+          wheels = list(dist.glob("*.whl"))
+          assert sdists, "missing sdist"
+          assert wheels, "missing wheel"
+
+          bad = []
+          with tarfile.open(sdists[0], "r:gz") as tf:
+              names = tf.getnames()
+              for name in names:
+                  if "__pycache__" in name or name.endswith((".pyc", ".pyo")):
+                      bad.append(name)
+              assert any(n.endswith("LICENSE") or n.endswith("/LICENSE") for n in names), names
+              assert any("CHANGELOG.md" in n for n in names), names
+              assert any("README.md" in n for n in names), names
+              assert any(n.endswith("py.typed") for n in names), names
+
+          with zipfile.ZipFile(wheels[0]) as zf:
+              names = zf.namelist()
+              for name in names:
+                  if "__pycache__" in name or name.endswith((".pyc", ".pyo")):
+                      bad.append(name)
+              assert any(n.endswith("py.typed") for n in names), "wheel missing py.typed"
+              assert any(
+                  ".dist-info/LICENSE" in n or n.endswith("LICENSE") for n in names
+              ), "wheel missing LICENSE"
+              # entry_points.txt must declare the console script
+              ep_names = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+              assert ep_names, "wheel missing entry_points.txt"
+              ep_text = zf.read(ep_names[0]).decode("utf-8")
+              assert "stackpilot" in ep_text, ep_text
+              assert "stackpilot.cli:main" in ep_text, ep_text
+              # METADATA must include classifiers / project URLs
+              meta_names = [n for n in names if n.endswith(".dist-info/METADATA")]
+              assert meta_names, "wheel missing METADATA"
+              meta = zf.read(meta_names[0]).decode("utf-8")
+              assert "Programming Language :: Python :: 3.10" in meta
+              assert "Programming Language :: Python :: 3.13" in meta
+              assert "Home-page:" in meta or "Project-URL:" in meta
+
+          assert not bad, bad
+          print("artifacts ok", sdists[0].name, wheels[0].name)
+          PY
+
+      - name: Install from wheel and verify CLI
+        run: |
+          python -m pip install dist/*.whl
+          stackpilot version
+          stackpilot doctor || true
+          python -m stackpilot version
+          python -m stackpilot --help
+          # Create a minimal project and confirm doctor/graph/module entry work
+          mkdir -p /tmp/sp-wheel-check/svc
+          cat > /tmp/sp-wheel-check/Stackfile.py <<'EOF'
+          from stackpilot import Stack
+          stack = Stack()
+          stack.service(
+              name="demo",
+              path="./svc",
+              command="python -c \"print('ok')\"",
+          )
+          stack.run()
+          EOF
+          cd /tmp/sp-wheel-check
+          stackpilot doctor
+          stackpilot graph
+          python -m stackpilot doctor
+
+      - name: Fail if README rendering is broken
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          text = Path("README.md").read_text(encoding="utf-8")
+          assert text.strip(), "README.md is empty"
+          # Basic structure checks (twine already validates long_description)
+          for heading in ("## Quick Start", "## Commands", "## Troubleshooting", "## FAQ"):
+              assert heading in text, f"missing section {heading}"
+          # No references to removed CLI / log system
+          assert "stackpilot logs" not in text or "Where did" in text
+          assert ".stackpilot/logs/" not in text or "not `.stackpilot/logs/`" in text
+          # Public commands still documented
+          for cmd in ("init", "sync", "run", "graph", "status", "ps", "issues", "doctor", "version"):
+              assert f"stackpilot {cmd}" in text or f"`{cmd}`" in text, cmd
+          print("README structure ok")
+          PY

@@ -1,0 +1,51 @@
+# Runtime / local StackPilot state
+.stackpilot/
+.logs/
+
+# Node (example installs)
+node_modules/
+
+# Python caches & bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# Packaging / build
+dist/
+dist-audit/
+build/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Temp / local scratch
+*.tmp
+*.log
+_gen_*.py
+scratch/
+experiment/
+draft/
+test_output/

@@ -1,0 +1,155 @@
+"""Health Check Engine — wait until a service becomes healthy."""
+
+from __future__ import annotations
+
+import time
+from subprocess import Popen
+from typing import Callable, Mapping, Optional, Union
+
+from .config import (
+    DEFAULT_HEALTH_INTERVAL_S,
+    DEFAULT_HEALTH_PROBE_TIMEOUT_S,
+    DEFAULT_HEALTH_TIMEOUT_S,
+    HealthCheck,
+    HealthCheckInput,
+    HttpHealthCheck,
+    ProcessHealthCheck,
+    TcpHealthCheck,
+    coerce_health_check,
+    parse_health_check,
+)
+from .http_checker import check_http
+from .process_checker import check_process
+from .tcp_checker import check_tcp
+
+# Re-export defaults under historical names used by tests / docs.
+DEFAULT_INTERVAL_S = DEFAULT_HEALTH_INTERVAL_S
+DEFAULT_TIMEOUT_S = DEFAULT_HEALTH_TIMEOUT_S
+DEFAULT_PROBE_TIMEOUT_S = DEFAULT_HEALTH_PROBE_TIMEOUT_S
+
+
+class HealthCheckError(Exception):
+    """Base error for health-check failures."""
+
+
+class HealthCheckTimeout(HealthCheckError):
+    """Raised when a service does not become healthy before the deadline."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"{name} failed health check")
+
+
+class Health:
+    """
+    Dispatch and poll health checks until success or timeout.
+
+    Checkers live in dedicated modules; this class owns retry / timeout
+    orchestration only.
+    """
+
+    @classmethod
+    def wait_until_healthy(
+        cls,
+        name: str,
+        health_check: Optional[HealthCheckInput],
+        *,
+        process: Optional[Popen[str]] = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> float:
+        """
+        Block until ``health_check`` succeeds for ``name``.
+
+        Returns elapsed seconds. Raises ``HealthCheckTimeout`` on failure.
+        When ``health_check`` is ``None``, defaults to a process liveness check.
+        Accepts typed ``HealthCheck`` models or legacy mapping configs.
+        """
+
+        cfg = cls._normalize(health_check)
+        interval = float(cfg.interval)
+        timeout_s = float(cfg.timeout)
+
+        started = clock()
+        deadline = started + timeout_s
+
+        while True:
+            # Fail fast when the child already exited — waiting out the full
+            # health timeout only delays diagnostics and does not help.
+            if process is not None and process.poll() is not None:
+                raise HealthCheckTimeout(name)
+            if cls.dispatch(cfg, process=process):
+                return clock() - started
+            if cls.timeout(deadline, clock=clock):
+                raise HealthCheckTimeout(name)
+            cls.retry(interval, sleep=sleep)
+
+    @classmethod
+    def dispatch(
+        cls,
+        health_check: Union[HealthCheck, Mapping],
+        *,
+        process: Optional[Popen[str]] = None,
+    ) -> bool:
+        """Run a single health-check attempt. Returns True when healthy."""
+
+        try:
+            cfg = (
+                health_check
+                if isinstance(
+                    health_check,
+                    (ProcessHealthCheck, HttpHealthCheck, TcpHealthCheck),
+                )
+                else parse_health_check(health_check)
+            )
+        except ValueError as exc:
+            raise HealthCheckError(str(exc)) from exc
+
+        probe_timeout = float(cfg.probe_timeout)
+
+        if isinstance(cfg, HttpHealthCheck):
+            if not cfg.url:
+                return False
+            return check_http(cfg.url, request_timeout=probe_timeout)
+
+        if isinstance(cfg, TcpHealthCheck):
+            return check_tcp(cfg.host, cfg.port, connect_timeout=probe_timeout)
+
+        if isinstance(cfg, ProcessHealthCheck):
+            return check_process(process)
+
+        raise HealthCheckError(f"Unknown health check type: {type(cfg)!r}")
+
+    @classmethod
+    def timeout(
+        cls,
+        deadline: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> bool:
+        """Return True when ``clock()`` has reached or passed ``deadline``."""
+
+        return clock() >= deadline
+
+    @classmethod
+    def retry(
+        cls,
+        interval: float,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Wait ``interval`` seconds before the next probe attempt."""
+
+        sleep(max(0.0, float(interval)))
+
+    @classmethod
+    def _normalize(
+        cls,
+        health_check: Optional[HealthCheckInput],
+    ) -> HealthCheck:
+        if health_check is None:
+            return ProcessHealthCheck(
+                interval=DEFAULT_INTERVAL_S,
+                timeout=DEFAULT_TIMEOUT_S,
+            )
+        return coerce_health_check(health_check)  # type: ignore[return-value]
