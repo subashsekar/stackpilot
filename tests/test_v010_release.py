@@ -390,6 +390,7 @@ class TestCliErrorContract:
             "init",
             "sync",
             "run",
+            "stop",
             "graph",
             "status",
             "ps",

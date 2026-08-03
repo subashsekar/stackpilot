@@ -12,8 +12,10 @@ from .express import ExpressAdapter
 from .fastapi import FastAPIAdapter
 from .flask import FlaskAdapter
 from .generic import GenericAdapter
+from .mongodb import MongoDBAdapter
 from .nestjs import NestJSAdapter
 from .postgres import PostgresAdapter
+from .rabbitmq import RabbitMQAdapter
 from .redis import RedisAdapter
 
 
@@ -107,6 +109,8 @@ def create_default_registry() -> AdapterRegistry:
             FastAPIAdapter(),
             FlaskAdapter(),
             PostgresAdapter(),
+            MongoDBAdapter(),
+            RabbitMQAdapter(),
             RedisAdapter(),
             GenericAdapter(),
         ]

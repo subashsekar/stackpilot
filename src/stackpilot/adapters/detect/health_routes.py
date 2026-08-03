@@ -783,6 +783,17 @@ def _nestjs_routes_from_source(source: str) -> list[str]:
             source,
         )
     ]
+    # Object-form controllers: ``@Controller({ path: 'health' })``
+    for match in re.finditer(
+        r"""@Controller\s*\(\s*\{[^}]*\bpath\s*:\s*['\"]([^'\"]*)['\"]""",
+        source,
+        re.DOTALL,
+    ):
+        controller_positions.append(
+            (match.start(), normalize_route(match.group(1) or "/"))
+        )
+    controller_positions.sort(key=lambda item: item[0])
+
     get_matches = list(
         re.finditer(
             r"""@Get\s*\(\s*(?:['\"]([^'\"]*)['\"])?\s*\)""",

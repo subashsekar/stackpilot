@@ -24,7 +24,7 @@ stackpilot run
 ## Features
 
 - **One config file** — declare services and external dependencies in `Stackfile.py`
-- **Auto-discovery** — `stackpilot sync` detects FastAPI, Flask, Django, Celery, Express, NestJS, Postgres, Redis, and more
+- **Auto-discovery** — `stackpilot sync` detects FastAPI, Flask, Django, Celery, Express, NestJS, Postgres, Redis, MongoDB, RabbitMQ, and more
 - **Apps vs infrastructure** — only application services are started; Postgres/Redis are validated as external dependencies
 - **Dependency-aware startup** — services start in topological order
 - **Health checks** — HTTP, TCP, or process liveness before dependents launch
@@ -69,6 +69,8 @@ stackpilot init          # create Stackfile.py
 # edit services, or:
 stackpilot sync          # auto-discover nested services
 stackpilot run           # start + stream logs (Ctrl+C to stop)
+stackpilot stop          # terminate a leftover session
+stackpilot status        # runtime table (PID / port / uptime)
 ```
 
 You can also execute the Stackfile directly:
@@ -155,29 +157,54 @@ Soft validation warnings (for example FastAPI without uvicorn) never abort sync.
 dependency order, stream live logs, and hot-reload changed services until you
 press Ctrl+C.
 
-This is the main foreground command. There is no separate `stop` or `restart`
-command in v0.1.x — stop with Ctrl+C; restart on file change is automatic while
-`run` is active.
-
 ```bash
 stackpilot run             # start the full stack
 stackpilot run auth        # start auth and its dependencies only
+stackpilot run --force     # clear a stale session, then start
 ```
 
-| Argument | Definition |
-|----------|------------|
+| Argument / Option | Definition |
+|-------------------|------------|
 | `SERVICE` (optional) | Service name to start, plus everything it depends on |
+| `--force` | Stop leftover processes / clear stale `runtime.json`, then start |
 
 **What it does:**
 
-1. Checks required external dependencies (Postgres/Redis) with retry + timeout
-2. Starts apps in topological order and waits for health checks
-3. Streams `INFO` / `WARNING` / `ERROR` lines to the terminal
-4. Watches files and reloads affected services when enabled
-5. On Ctrl+C: disable reload → stop process trees → stop watchers → exit `130`
+1. Detects a stale prior session (live PIDs or occupied StackPilot ports) and
+   asks you to run `stackpilot stop` (or pass `--force`)
+2. Checks required external dependencies (Postgres/Redis/MongoDB/RabbitMQ) with
+   retry + timeout
+3. Starts apps in topological order and waits for health checks
+4. Streams `INFO` / `WARNING` / `ERROR` lines to the terminal
+5. Watches files and reloads affected services when enabled
+6. On Ctrl+C: disable reload → stop process trees → stop watchers → exit `130`
 
 Use `status` / `ps` for runtime tables and `issues` for persisted problems —
 `run` itself only starts services and streams logs.
+
+---
+
+### `stackpilot stop`
+
+**Definition:** Terminate every service recorded in `.stackpilot/runtime.json`.
+
+Use this when a previous `stackpilot run` did not shut down cleanly (closed
+terminal, crash, etc.) and ports / processes are still held.
+
+```bash
+stackpilot stop
+```
+
+**What it does:**
+
+1. Reads `.stackpilot/runtime.json`
+2. Stops each recorded process tree (Windows Job Objects / `taskkill /T`;
+   Linux/macOS process groups)
+3. Ignores already-dead PIDs and clears stale runtime entries
+4. Prints a short summary (`Stopping auth...` → `✓ N services stopped.`)
+
+If there is no runtime file: `No running StackPilot session.`  
+Corrupted runtime files are cleared without a traceback.
 
 ---
 
@@ -535,13 +562,15 @@ uvicorn) never abort sync.
 
 | Framework | Detection signals | Generated command | Health |
 |-----------|-------------------|-------------------|--------|
-| NestJS | `package.json` + `@nestjs/core` | `<pm> run start:dev` | HTTP `/` |
+| NestJS | `package.json` + `@nestjs/core` | `<pm> run start:dev` | HTTP `/health` when exposed, else TCP |
 | Express | `package.json` + `express` | `<pm> run dev` | HTTP `/` |
 | Django | `manage.py` + settings / WSGI / ASGI | `python manage.py runserver` | HTTP `/` |
 | Celery | `Celery()` / worker modules | `celery -A <app> worker` | PROCESS |
 | FastAPI | `FastAPI()` / common layouts | `python -m uvicorn <module>:<attr> --reload` | HTTP `/health` |
-| Flask | `Flask()` / `create_app()` | `python app.py` or `flask --app … run` | HTTP `/` |
+| Flask | `Flask()` / `create_app()` | `flask --app … run --host 0.0.0.0 --port N` | HTTP `/` |
 | PostgreSQL | compose / `postgresql.conf` | `external_dependency` (TCP `5432`) — never started | TCP |
+| MongoDB | compose / `mongod.conf` / `mongodb://` | `external_dependency` (TCP `27017`) — never started | TCP |
+| RabbitMQ | compose / `amqp://` / `rabbitmq:3` | `external_dependency` (TCP `5672`) — never started | TCP |
 | Redis | `redis.conf` / compose | `external_dependency` (TCP `6379`) — never started | TCP |
 | Generic | `main.py` / `app.py` / bare `package.json` | `python …` or `<pm> start` | PROCESS |
 
@@ -557,7 +586,13 @@ See [`examples/`](examples/) for minimal projects per framework.
 
 1. `.env` / `.env.*` keys (`PORT`, `APP_PORT`, …)
 2. Compose host port mappings
-3. Sequential defaults from `8000` (Postgres `5432`, Redis `6379`)
+3. Sequential defaults from `8000` (Postgres `5432`, Redis `6379`,
+   MongoDB `27017`, RabbitMQ `5672`)
+
+When a preferred Flask port is already taken by another discovered service,
+StackPilot assigns the next free coordination port and generates
+`flask run --host 0.0.0.0 --port {assigned}` so the process actually listens
+on the Stackfile port (not a hardcoded `app.run(port=…)`).
 
 ### Custom adapters
 
@@ -638,10 +673,10 @@ are spawned as your user. Review Stackfiles like you would a Makefile. See
 Yes. Discovery walks parents like Git. Artifacts stay under the project root.
 
 **How do I stop everything?**  
-Press Ctrl+C in the `stackpilot run` terminal. StackPilot disables hot reload,
-stops process trees (dependents first), stops file watchers, clears runtime
-bindings, and closes the logger. Exit code is `130`. There is no separate
-`stop` / `restart` CLI command in v0.1.x.
+Prefer Ctrl+C in the active `stackpilot run` terminal. To clean up after a
+crash or closed terminal, run `stackpilot stop` — it reads `runtime.json`,
+stops process trees, and clears stale entries. If `stackpilot run` reports an
+existing session, run `stackpilot stop` or `stackpilot run --force`.
 
 **What happens during shutdown?**  
 `disable reload → stop processes → stop watchers → unbind → logger shutdown`.
@@ -649,13 +684,14 @@ A shutdown summary lists each stopped service. Orphan children should not remain
 
 **What about restart / hot reload?**  
 While `run` is active, file watchers restart changed services (when
-`reload=True`, or when Windows takes over uvicorn/Django native reload).
-Debounced callbacks are ignored once Ctrl+C begins shutdown. Limitations:
+`reload=True`, or when Windows takes over uvicorn/Django/Flask-debug native
+reload). Debounced callbacks are ignored once Ctrl+C begins shutdown. Limitations:
 
 - Generator defaults do **not** set `reload=True`; FastAPI often relies on
   uvicorn `--reload` instead.
-- On Windows, StackPilot strips uvicorn `--reload` / Django auto-reload and
-  owns restart so `CTRL_C_EVENT` cannot tear down the whole stack.
+- On Windows, StackPilot strips uvicorn `--reload` / Django auto-reload /
+  Flask `--debug` and owns restart so `CTRL_C_EVENT` cannot tear down the
+  whole stack.
 - Reload restarts only the changed service (plus `restart_dependents` when set).
 
 **Where did `stackpilot logs` go?**  
@@ -668,7 +704,7 @@ and port conflicts print a short **Problem / Affected service / Reason /
 Suggested fix** block without a raw traceback. Run `stackpilot doctor` for
 deeper checks.
 
-**What if Postgres/Redis is down?**  
+**What if Postgres/Redis/MongoDB/RabbitMQ is down?**  
 External dependency validation retries (default 5 attempts with delay/backoff)
 until the configured timeout, then aborts **before** starting application
 processes. The message lists host, port, elapsed time, attempts, dependents,
@@ -685,12 +721,12 @@ and the next action.
   already be running (or reachable) as external dependencies.
 - Generator defaults do **not** set `reload=True`; many frameworks rely on their
   own reload flags (`uvicorn --reload`, etc.).
-- On Windows, StackPilot may strip native uvicorn/Django reload and own restarts
-  so `CTRL_C_EVENT` cannot tear down the whole stack.
+- On Windows, StackPilot may strip native uvicorn/Django/Flask-debug reload and
+  own restarts so `CTRL_C_EVENT` cannot tear down the whole stack.
 - Hot reload restarts the changed service (plus `restart_dependents` when set),
   not the entire graph.
-- There is no separate `stop` / `restart` CLI command in v0.1.x — use Ctrl+C
-  and file watchers while `run` is active.
+- `stackpilot stop` cleans recorded runtime PIDs; processes started outside
+  StackPilot are not managed.
 - `Stackfile.py` is trusted code (see [SECURITY.md](SECURITY.md)).
 
 ---
@@ -701,11 +737,12 @@ and the next action.
 |---------|-------------|
 | `No Stackfile.py found` | `stackpilot init` or `stackpilot sync` from the project root |
 | Sync finds nothing | Put each service in a **nested** directory (the project root itself is never a service) |
-| Port already in use | Change `port=` / health URL, or free the port |
+| Existing StackPilot session detected | `stackpilot stop` or `stackpilot run --force` |
+| Port already in use | `stackpilot stop`, change `port=` / health URL, or free the port |
 | Executable not found | Activate the project venv or fix `command=` — then `stackpilot doctor` |
 | Permission denied | Check execute bits / antivirus locks on the service path |
 | Invalid cwd / bad path | Fix `path=` so it exists under the project root |
-| Dependency unavailable | Start Postgres/Redis (or fix host/port); wait for boot; re-run |
+| Dependency unavailable | Start Postgres/Redis/MongoDB/RabbitMQ (or fix host/port); wait for boot; re-run |
 | Health endpoint missing | Confirm the route exists and matches `health_check=` |
 | Health timeout | Check the run terminal, `stackpilot issues <name>`, then doctor |
 | Service fails on start | `stackpilot issues <name>` and open the referenced `FILE:LINE` |

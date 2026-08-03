@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -87,6 +88,23 @@ def django_runserver_has_autoreload(command: str | Sequence[str]) -> bool:
     return "--noreload" not in lowered
 
 
+def has_flask_debug(command: str | Sequence[str]) -> bool:
+    """True when ``command`` enables Flask debug / reloader."""
+
+    tokens = _command_tokens(command)
+    lowered = [t.lower() for t in tokens]
+    if not lowered:
+        return False
+    if "flask" in lowered and "--debug" in lowered:
+        return True
+    joined = " ".join(lowered)
+    if "flask" in lowered and (
+        "flask_debug=1" in joined or "flask_env=development" in joined
+    ):
+        return True
+    return False
+
+
 def should_takeover_native_reload(command: str | Sequence[str]) -> bool:
     """
     True when StackPilot must own reload instead of the framework.
@@ -96,14 +114,16 @@ def should_takeover_native_reload(command: str | Sequence[str]) -> bool:
     down the whole stack. Django ``runserver`` autoreload is also taken over
     on Windows so StackPilot can restart the full process on file changes
     (failed Django reloads can leave a dead server thread while the parent
-    stays "alive").
+    stays "alive"). Flask ``--debug`` is taken over for the same reason.
     """
 
     if sys.platform != "win32":
         return False
     if has_uvicorn_reload_flag(command):
         return True
-    return django_runserver_has_autoreload(command)
+    if django_runserver_has_autoreload(command):
+        return True
+    return has_flask_debug(command)
 
 
 def strip_native_reload_argv(argv: Sequence[str]) -> list[str]:
@@ -122,6 +142,9 @@ def strip_native_reload_argv(argv: Sequence[str]) -> list[str]:
             skip_next = True
             continue
         if any(lower.startswith(f"{flag}=") for flag in _RELOAD_FLAGS_WITH_VALUE):
+            continue
+        if lower == "--debug" and "flask" in [t.lower() for t in out]:
+            # Drop Flask --debug under Windows takeover.
             continue
         out.append(token)
 
@@ -150,13 +173,7 @@ def has_native_reload(command: str | Sequence[str]) -> bool:
     if django_runserver_has_autoreload(tokens):
         return True
 
-    # flask --debug / flask run --debug
-    if "flask" in lowered and "--debug" in lowered:
-        return True
-
-    # Common env-style debug launchers embedded in the command string.
-    joined = " ".join(lowered)
-    if "flask" in lowered and ("flask_debug=1" in joined or "flask_env=development" in joined):
+    if has_flask_debug(tokens):
         return True
 
     return False
@@ -365,7 +382,18 @@ class _DebouncedHandler(FileSystemEventHandler):
         if event_type in {"created", "moved"}:
             return old != sig
         if event_type == "modified":
-            return old != sig
+            if old != sig:
+                return True
+            if sys.platform == "win32" and old is not None:
+                # Some Windows writers notify before the new mtime is visible.
+                # Re-stat once; ignore pure no-op / focus noise when unchanged.
+                time.sleep(0.02)
+                sig2 = self._signature(path)
+                if sig2 is None:
+                    return False
+                self._signatures[key] = sig2
+                return sig2 != old
+            return False
         return True
 
     def _forget_tree(self, path: Path) -> None:

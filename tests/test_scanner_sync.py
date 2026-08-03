@@ -271,7 +271,8 @@ class TestStackfileGeneration:
 
         assert {s.framework for s in services} == {"FastAPI", "Flask"}
         assert "python -m uvicorn main:app --reload" in text
-        assert 'command="python app.py"' in text
+        assert "python -m flask --app app:app run --host 0.0.0.0 --port" in text
+        assert "python app.py" not in text
         assert "--port 8000" in text
         assert "port=8001," in text
 

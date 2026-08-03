@@ -154,12 +154,23 @@ def detect_preferred_port(directory: Path) -> int | None:
     return None
 
 
+_MONGOD_CONF_PORT_RE = re.compile(
+    r"""^\s*port\s*:\s*(\d{2,5})\s*(?:#.*)?$""",
+    re.MULTILINE | re.IGNORECASE,
+)
+_RABBIT_CONF_PORT_RE = re.compile(
+    r"""^\s*listeners\.tcp\.default\s*=\s*(\d{2,5})\s*(?:#.*)?$""",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def detect_infra_port(directory: Path, *, kind: str) -> int | None:
     """
-    Detect a PostgreSQL / Redis listen port from conf or compose.
+    Detect a PostgreSQL / Redis / MongoDB / RabbitMQ listen port from conf
+    or compose.
 
-    ``kind`` is ``postgres`` or ``redis``. Returns ``None`` when the project
-    does not declare a port (do not invent one).
+    ``kind`` is ``postgres``, ``redis``, ``mongodb``, or ``rabbitmq``.
+    Returns ``None`` when the project does not declare a port (do not invent).
     """
 
     root = directory.expanduser()
@@ -194,6 +205,40 @@ def detect_infra_port(directory: Path, *, kind: str) -> int | None:
                 port = _compose_service_host_port(
                     read_text(compose),
                     service_keys=("redis", "cache"),
+                )
+                if port is not None:
+                    return port
+        return None
+
+    if key in {"mongodb", "mongo"}:
+        conf = root / "mongod.conf"
+        if conf.is_file():
+            match = _MONGOD_CONF_PORT_RE.search(read_text(conf))
+            if match:
+                return _valid_port(int(match.group(1)))
+        for name in COMPOSE_FILENAMES:
+            compose = root / name
+            if compose.is_file():
+                port = _compose_service_host_port(
+                    read_text(compose),
+                    service_keys=("mongo", "mongodb"),
+                )
+                if port is not None:
+                    return port
+        return None
+
+    if key in {"rabbitmq", "rabbit", "amqp"}:
+        conf = root / "rabbitmq.conf"
+        if conf.is_file():
+            match = _RABBIT_CONF_PORT_RE.search(read_text(conf))
+            if match:
+                return _valid_port(int(match.group(1)))
+        for name in COMPOSE_FILENAMES:
+            compose = root / name
+            if compose.is_file():
+                port = _compose_service_host_port(
+                    read_text(compose),
+                    service_keys=("rabbitmq", "rabbit", "amqp", "broker"),
                 )
                 if port is not None:
                     return port

@@ -75,8 +75,26 @@ class TestFlaskAdapter:
             "if __name__ == '__main__':\n"
             "    app.run()\n",
         )
-        spec = FlaskAdapter().generate_service(service, port=8000)
+        # Without an assigned port, keep the direct ``python app.py`` launcher.
+        spec = FlaskAdapter().generate_service(service)
         assert spec.command == "python app.py"
+
+    def test_generate_flask_run_uses_assigned_port(self, tmp_path: Path) -> None:
+        service = tmp_path / "web"
+        _write(
+            service / "app.py",
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "if __name__ == '__main__':\n"
+            "    app.run(host='0.0.0.0', port=8001)\n",
+        )
+        # Assigned port must appear on the command even when source hardcodes
+        # a different preferred port (occupied-port reassignment).
+        spec = FlaskAdapter().generate_service(service, port=8002)
+        assert spec.command == (
+            "python -m flask --app app:app run --host 0.0.0.0 --port 8002"
+        )
+        assert "python app.py" not in spec.command
 
     def test_generate_flask_run_without_main(self, tmp_path: Path) -> None:
         service = tmp_path / "web"

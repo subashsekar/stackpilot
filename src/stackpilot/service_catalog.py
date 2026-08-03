@@ -18,6 +18,10 @@ _EXTERNAL_NAME_ALIASES: Mapping[str, str] = {
     "pgsql": "postgres",
     "pg": "postgres",
     "redis": "redis",
+    "mongodb": "mongodb",
+    "mongo": "mongodb",
+    "rabbitmq": "rabbitmq",
+    "amqp": "rabbitmq",
 }
 
 

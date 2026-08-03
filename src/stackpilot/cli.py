@@ -51,16 +51,17 @@ from .utils import load_stack_from_stackfile, safe_echo
 # Public CLI surface — FROZEN for v0.1.x until v0.2.0.
 #
 # Official commands (registration order matches ``stackpilot --help``):
-#   init, sync, run, graph, status, ps, issues, doctor, version
+#   init, sync, run, stop, graph, status, ps, issues, doctor, version
 #
 # This list is the public API for v0.1.0. Do NOT add, remove, or rename
-# commands here without an explicit v0.2.0 release decision. Architecture
+# commands here without an explicit release decision. Architecture
 # is likewise frozen for the v0.1.0 stabilization window.
 # ---------------------------------------------------------------------------
 PUBLIC_CLI_COMMANDS = (
     "init",
     "sync",
     "run",
+    "stop",
     "graph",
     "status",
     "ps",
@@ -165,6 +166,11 @@ def run(
         help="Optional service name. Starts that service and its dependencies.",
         metavar="SERVICE",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Clear a stale StackPilot session before starting.",
+    ),
 ) -> None:
     """
     Start services and stream live logs.
@@ -176,10 +182,34 @@ def run(
     Examples:
       stackpilot run
       stackpilot run auth
+      stackpilot run --force
     """
 
     project = _require_project()
     stack = _load_stack(project.stackfile)
+
+    from .runtime_control import (
+        clear_runtime_session,
+        detect_stale_session,
+        format_stale_session_error,
+        stop_runtime_session,
+    )
+
+    try:
+        stale = detect_stale_session(project.root, stack.services)
+    except Exception:
+        stale = None
+
+    if stale is not None:
+        if force:
+            try:
+                stop_runtime_session(project.root)
+            except Exception:
+                clear_runtime_session(project.root)
+        else:
+            typer.secho(format_stale_session_error(stale), err=True, fg="red")
+            raise typer.Exit(code=1)
+
     try:
         code = Orchestrator().run(
             stack,
@@ -209,6 +239,30 @@ def run(
         typer.secho(message, err=True, fg="red")
         raise typer.Exit(code=1)
     raise typer.Exit(code=code)
+
+
+@app.command()
+def stop() -> None:
+    """Stop every service started by StackPilot."""
+
+    project = _require_project()
+    from .runtime_control import stop_runtime_session
+
+    try:
+        result = stop_runtime_session(project.root)
+    except Exception as e:
+        typer.secho(
+            f"Failed to stop StackPilot session: {e}",
+            err=True,
+            fg="red",
+        )
+        raise typer.Exit(code=1)
+
+    safe_echo(
+        result.message,
+        ascii_fallback=result.message.replace("✓", "+"),
+    )
+    raise typer.Exit(code=result.exit_code)
 
 
 @app.command()

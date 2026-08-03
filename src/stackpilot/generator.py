@@ -138,8 +138,8 @@ def generate_stackfile(
     """
     Render a complete runnable ``Stackfile.py``.
 
-    Application services receive ``stack.service(...)``. PostgreSQL / Redis
-    (and other adapters marked ``external``) receive
+    Application services receive ``stack.service(...)``. PostgreSQL / Redis /
+    MongoDB / RabbitMQ (and other adapters marked ``external``) receive
     ``stack.external_dependency(...)`` — never started by StackPilot.
 
     When a nearby ``services.json`` / ``services.yaml`` catalog exists, its

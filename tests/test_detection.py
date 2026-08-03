@@ -471,6 +471,7 @@ class TestIgnoreAndMonorepoRegression:
         text = generate_stackfile(services, project_root=tmp_path)
         assert "from stackpilot import Stack, HttpHealthCheck" in text
         assert "uvicorn app.main:app" in text
-        assert 'command="python app.py"' in text
+        assert "python -m flask --app app:app run --host 0.0.0.0 --port" in text
+        assert "python app.py" not in text
         assert "reload=True," in text
         assert "stack.run()" in text

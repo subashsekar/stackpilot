@@ -4,10 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import AdapterServiceSpec, FrameworkAdapter, load_package_json, package_has_dependency
+from .base import (
+    AdapterServiceSpec,
+    FrameworkAdapter,
+    load_package_json,
+    package_has_dependency,
+    read_text,
+)
 from .detect.health_routes import discover_health_path
 from .detect.package_manager import node_run_command
 from .detect.ports import detect_preferred_port
+from .detect.scan import iter_project_files
 from .detect.scripts import prefer_node_script, script_implies_reload
 
 
@@ -49,6 +56,8 @@ class NestJSAdapter(FrameworkAdapter):
             }
 
         health_path = discover_health_path(directory, self.name)
+        if health_path is None:
+            health_path = _nestjs_fallback_health_path(directory)
         preferred = detect_preferred_port(directory)
         return AdapterServiceSpec(
             framework=self.name,
@@ -59,6 +68,34 @@ class NestJSAdapter(FrameworkAdapter):
             preferred_port=preferred,
             reload=reload,
         )
+
+
+def _nestjs_fallback_health_path(directory: Path) -> str | None:
+    """
+    Prefer HTTP ``/health`` when the app clearly exposes it.
+
+    Covers ``@nestjs/terminus`` and common HealthController layouts that the
+    decorator walk may miss. Returns ``None`` when nothing indicates /health
+    so callers fall back to TCP.
+    """
+
+    if package_has_dependency(directory, "@nestjs/terminus"):
+        return "/health"
+
+    for path in iter_project_files(directory, suffixes=(".ts", ".js"), max_depth=5):
+        text = read_text(path)
+        if not text:
+            continue
+        lower = text.lower()
+        if "@healthcheck" in lower or "healthcheckservice" in lower:
+            return "/health"
+        if "healthcontroller" in lower.replace(" ", ""):
+            return "/health"
+        if "@controller('health')" in lower or '@controller("health")' in lower:
+            return "/health"
+        if "@controller" in lower and "path:" in lower and "health" in lower:
+            return "/health"
+    return None
 
 
 def _fallback_node_command(directory: Path) -> str:

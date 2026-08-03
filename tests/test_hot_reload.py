@@ -81,14 +81,16 @@ def test_strip_native_reload_argv_adds_django_noreload() -> None:
 def test_should_takeover_native_reload_windows_only() -> None:
     cmd = "uvicorn app:app --reload"
     django = "python manage.py runserver 0.0.0.0:8000"
+    flask_debug = "flask --debug run"
     if sys.platform == "win32":
         assert should_takeover_native_reload(cmd) is True
         assert should_takeover_native_reload(django) is True
+        assert should_takeover_native_reload(flask_debug) is True
     else:
         assert should_takeover_native_reload(cmd) is False
         assert should_takeover_native_reload(django) is False
+        assert should_takeover_native_reload(flask_debug) is False
     assert should_takeover_native_reload("uvicorn app:app") is False
-    assert should_takeover_native_reload("flask --debug run") is False
     assert should_takeover_native_reload(
         "python manage.py runserver --noreload 8000"
     ) is False

@@ -79,7 +79,23 @@ def _build_flask_command(
 ) -> str:
     flask_entry = entry if isinstance(entry, FlaskEntrypoint) else None
 
-    # Only emit ``python app.py`` when the file actually starts the server.
+    if flask_entry is not None:
+        target = flask_entry.target
+    else:
+        target = "app:app"
+
+    # When StackPilot assigns a listen port, always emit ``flask run --port``
+    # so the process binds the Stackfile port. ``python app.py`` often hardcodes
+    # ``app.run(port=…)`` and would ignore reassignment when the preferred port
+    # is already occupied.
+    if port is not None:
+        return (
+            f"{runner} -m flask --app {target} run "
+            f"--host 0.0.0.0 --port {port}"
+        )
+
+    # No assigned port (direct adapter call): keep ``python app.py`` only when
+    # the file actually starts the server under ``__main__``.
     if (
         flask_entry is not None
         and not flask_entry.is_factory
@@ -89,15 +105,7 @@ def _build_flask_command(
     ):
         return f"{python} app.py"
 
-    if flask_entry is not None:
-        target = flask_entry.target
-    else:
-        target = "app:app"
-
-    command = f"{runner} -m flask --app {target} run --host 0.0.0.0"
-    if port is not None:
-        command = f"{command} --port {port}"
-    return command
+    return f"{runner} -m flask --app {target} run --host 0.0.0.0"
 
 
 def _has_runnable_main(path: Path) -> bool:

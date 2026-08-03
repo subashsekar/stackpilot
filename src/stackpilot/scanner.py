@@ -40,6 +40,10 @@ _CANONICAL_EXTERNAL_NAMES: Final[dict[str, str]] = {
     "postgresql": "postgres",
     "postgres": "postgres",
     "redis": "redis",
+    "mongodb": "mongodb",
+    "mongo": "mongodb",
+    "rabbitmq": "rabbitmq",
+    "amqp": "rabbitmq",
 }
 
 
