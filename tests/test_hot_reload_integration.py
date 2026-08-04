@@ -43,6 +43,21 @@ def _wait_http(url: str, *, timeout: float = 20.0) -> bool:
     return False
 
 
+def _force_kill_pids(pids: dict[str, int | None]) -> None:
+    """Best-effort kill leftover service PIDs after a timed harness join."""
+
+    from stackpilot.process_tree import signal_process_tree
+
+    for pid in pids.values():
+        if pid is None:
+            continue
+        try:
+            if pid_is_alive(pid):
+                signal_process_tree(int(pid), graceful=False)
+        except Exception:
+            pass
+
+
 class _ReloadHarness:
     """Run Orchestrator in a thread and edit files against a live stack."""
 
@@ -91,12 +106,26 @@ class _ReloadHarness:
         raise TimeoutError("watchers never became ready")
 
     def stop(self) -> None:
+        leftover = self.pids()
         try:
             self.orch.stop()
         except Exception:
             pass
         if self._thread is not None:
             self._thread.join(timeout=20)
+        # If shutdown outlived the join budget, force-kill children so later
+        # tests do not collide on ports / hang the suite (CI exit 143).
+        if self._thread is not None and self._thread.is_alive():
+            runner = self.orch._runner
+            if runner is not None and runner._manager is not None:
+                try:
+                    runner._manager.stop_all(timeout_s=0.1)
+                except Exception:
+                    pass
+            _force_kill_pids(leftover)
+            self._thread.join(timeout=5)
+        else:
+            _force_kill_pids(leftover)
 
     def blob(self) -> str:
         with self._lock:
@@ -336,7 +365,12 @@ def test_rapid_saves_single_reload(tmp_path: Path) -> None:
         command=f"{sys.executable} main.py",
         port=port,
         reload=True,
-        health_check=HttpHealthCheck(url=f"http://127.0.0.1:{port}/"),
+        health_check=HttpHealthCheck(
+            url=f"http://127.0.0.1:{port}/",
+            timeout=10.0,
+            interval=0.1,
+            probe_timeout=1.0,
+        ),
     )
     h = _ReloadHarness(root, stack, debounce_s=0.35)
     h.start()
@@ -376,7 +410,12 @@ def test_observer_survives_multiple_reloads(tmp_path: Path) -> None:
         command=f"{sys.executable} main.py",
         port=port,
         reload=True,
-        health_check=HttpHealthCheck(url=f"http://127.0.0.1:{port}/"),
+        health_check=HttpHealthCheck(
+            url=f"http://127.0.0.1:{port}/",
+            timeout=10.0,
+            interval=0.1,
+            probe_timeout=1.0,
+        ),
     )
     h = _ReloadHarness(root, stack, debounce_s=0.2)
     h.start()
@@ -428,9 +467,15 @@ def test_ctrl_c_exits_clean_after_reload(tmp_path: Path) -> None:
         command=f"{sys.executable} main.py",
         port=port,
         reload=True,
-        health_check=HttpHealthCheck(url=f"http://127.0.0.1:{port}/"),
+        health_check=HttpHealthCheck(
+            url=f"http://127.0.0.1:{port}/",
+            timeout=10.0,
+            interval=0.1,
+            probe_timeout=1.0,
+        ),
     )
     h = _ReloadHarness(root, stack)
+    after: int | None = None
     h.start()
     try:
         assert _wait_http(f"http://127.0.0.1:{port}/")
@@ -469,7 +514,12 @@ def test_only_changed_service_reloads(tmp_path: Path) -> None:
         command=f"{sys.executable} main.py",
         port=port_a,
         reload=True,
-        health_check=HttpHealthCheck(url=f"http://127.0.0.1:{port_a}/"),
+        health_check=HttpHealthCheck(
+            url=f"http://127.0.0.1:{port_a}/",
+            timeout=10.0,
+            interval=0.1,
+            probe_timeout=1.0,
+        ),
     )
     stack.service(
         name="b",
@@ -477,7 +527,12 @@ def test_only_changed_service_reloads(tmp_path: Path) -> None:
         command=f"{sys.executable} main.py",
         port=port_b,
         reload=True,
-        health_check=HttpHealthCheck(url=f"http://127.0.0.1:{port_b}/"),
+        health_check=HttpHealthCheck(
+            url=f"http://127.0.0.1:{port_b}/",
+            timeout=10.0,
+            interval=0.1,
+            probe_timeout=1.0,
+        ),
     )
     h = _ReloadHarness(root, stack)
     h.start()

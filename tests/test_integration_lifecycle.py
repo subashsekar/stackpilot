@@ -78,31 +78,45 @@ class TestFullLifecycle:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
+        stop_code: int | None = None
+        try:
+            # Wait until the service is RUNNING.
+            deadline = time.monotonic() + 8.0
+            running = False
+            while time.monotonic() < deadline:
+                if orch._runner is not None and orch._runner.is_bound:
+                    try:
+                        managed = orch._runner._manager.get("app")  # type: ignore[union-attr]
+                        if managed.pid is not None and managed.process is not None:
+                            if managed.process.poll() is None:
+                                running = True
+                                break
+                    except Exception:
+                        pass
+                time.sleep(0.05)
 
-        # Wait until the service is RUNNING.
-        deadline = time.monotonic() + 8.0
-        running = False
-        while time.monotonic() < deadline:
-            if orch._runner is not None and orch._runner.is_bound:
+            assert running, "service never became running"
+
+            # Issue tracker path under project root.
+            assert (project / DEFAULT_ISSUES_DIR).exists() or True
+
+            stop_code = orch.stop()
+            thread.join(timeout=10.0)
+            assert stop_code in {0, 130}
+            assert code_holder["code"] in {0, 1, 130, None} or thread.is_alive() is False
+        finally:
+            try:
+                orch.stop()
+            except Exception:
+                pass
+            if thread.is_alive():
+                thread.join(timeout=5.0)
+            runner_obj = orch._runner
+            if runner_obj is not None and runner_obj._manager is not None:
                 try:
-                    managed = orch._runner._manager.get("app")  # type: ignore[union-attr]
-                    if managed.pid is not None and managed.process is not None:
-                        if managed.process.poll() is None:
-                            running = True
-                            break
+                    runner_obj._manager.stop_all(timeout_s=0.1)
                 except Exception:
                     pass
-            time.sleep(0.05)
-
-        assert running, "service never became running"
-
-        # Issue tracker path under project root.
-        assert (project / DEFAULT_ISSUES_DIR).exists() or True
-
-        stop_code = orch.stop()
-        thread.join(timeout=10.0)
-        assert stop_code in {0, 130}
-        assert code_holder["code"] in {0, 1, 130, None} or thread.is_alive() is False
 
     def test_cli_init_sync_graph_doctor(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

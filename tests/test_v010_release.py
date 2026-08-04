@@ -375,8 +375,10 @@ class TestDxAndLogger:
         t2 = threading.Thread(target=muter)
         t1.start()
         t2.start()
-        t1.join()
-        t2.join()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        assert not t1.is_alive(), "writer thread hung"
+        assert not t2.is_alive(), "muter thread hung"
         # After mute, further emits must be dropped (no exception / deadlock).
         before = len(seen)
         log.stdout("a", "after")

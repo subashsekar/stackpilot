@@ -89,68 +89,84 @@ def test_monitor_stays_alive_after_one_crash(
 
     thread = threading.Thread(target=_run, name="stackpilot-monitor-test", daemon=True)
     thread.start()
+    code: int | None = None
+    try:
+        issue_path = issues_dir / "auth.issue"
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            joined = "\n".join(printed)
+            if (
+                "auth exited (exit 1)" in joined
+                and "Remaining services continue running." in joined
+                and issue_path.is_file()
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                "crash notice / issue file not observed\n" + "\n".join(printed)
+            )
 
-    issue_path = issues_dir / "auth.issue"
-    deadline = time.monotonic() + 8.0
-    while time.monotonic() < deadline:
-        joined = "\n".join(printed)
-        if (
-            "auth exited (exit 1)" in joined
-            and "Remaining services continue running." in joined
-            and issue_path.is_file()
-        ):
-            break
-        time.sleep(0.05)
-    else:
-        thread.join(timeout=0.1)
-        raise AssertionError(
-            "crash notice / issue file not observed\n" + "\n".join(printed)
-        )
+        # Monitor must still be alive after the crash.
+        assert thread.is_alive(), "monitor loop exited after a single crash"
 
-    # Monitor must still be alive after the crash.
-    assert thread.is_alive(), "monitor loop exited after a single crash"
+        text = issue_path.read_text(encoding="utf-8")
+        assert "ACTIVE" in text
+        assert "database.py:42" in text
+        assert "Issue:" in "\n".join(printed)
+        assert any("auth.issue" in line for line in printed)
 
-    text = issue_path.read_text(encoding="utf-8")
-    assert "ACTIVE" in text
-    assert "database.py:42" in text
-    assert "Issue:" in "\n".join(printed)
-    assert any("auth.issue" in line for line in printed)
+        # Surviving service continues streaming logs after the crash banner.
+        ticks_before = sum(1 for line in printed if "keeper tick" in line)
+        time.sleep(0.45)
+        ticks_after = sum(1 for line in printed if "keeper tick" in line)
+        assert ticks_after > ticks_before, "keeper stopped logging after sibling crash"
 
-    # Surviving service continues streaming logs after the crash banner.
-    ticks_before = sum(1 for line in printed if "keeper tick" in line)
-    time.sleep(0.45)
-    ticks_after = sum(1 for line in printed if "keeper tick" in line)
-    assert ticks_after > ticks_before, "keeper stopped logging after sibling crash"
+        # Watcher remains registered; reload callback still works post-crash.
+        runner = orchestrator._runner
+        assert runner is not None
+        assert runner._watch_manager is not None
+        assert "keeper" in runner._watch_manager.watched_services
 
-    # Watcher remains registered; reload callback still works post-crash.
-    runner = orchestrator._runner
-    assert runner is not None
-    assert runner._watch_manager is not None
-    assert "keeper" in runner._watch_manager.watched_services
+        runner.on_reload("keeper", [str(keeper_src)])
+        reload_deadline = time.monotonic() + 5.0
+        while time.monotonic() < reload_deadline:
+            joined = "\n".join(printed)
+            if "Reloading keeper" in joined and (
+                "keeper reloaded" in joined
+                or "keeper started" in joined
+                or "✓ keeper" in joined
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                "hot reload did not run after crash\n" + "\n".join(printed)
+            )
 
-    runner.on_reload("keeper", [str(keeper_src)])
-    reload_deadline = time.monotonic() + 5.0
-    while time.monotonic() < reload_deadline:
-        joined = "\n".join(printed)
-        if "Reloading keeper" in joined and (
-            "keeper reloaded" in joined or "keeper started" in joined or "✓ keeper" in joined
-        ):
-            break
-        time.sleep(0.05)
-    else:
-        raise AssertionError(
-            "hot reload did not run after crash\n" + "\n".join(printed)
-        )
+        assert thread.is_alive(), "monitor loop died during/after reload"
+        assert not any("Stopping StackPilot" in line for line in printed)
 
-    assert thread.is_alive(), "monitor loop died during/after reload"
-    assert not any("Stopping StackPilot" in line for line in printed)
-
-    # Explicit stop ends the session (Ctrl+C path).
-    code = orchestrator.stop()
-    thread.join(timeout=5.0)
-    assert not thread.is_alive()
-    assert code == 130
-    assert "Stopping StackPilot..." in "\n".join(printed)
+        # Explicit stop ends the session (Ctrl+C path).
+        code = orchestrator.stop()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        assert code == 130
+        assert "Stopping StackPilot..." in "\n".join(printed)
+    finally:
+        try:
+            orchestrator.stop()
+        except Exception:
+            pass
+        if thread.is_alive():
+            thread.join(timeout=5.0)
+        # Force-kill any leftover keeper/auth PIDs if stop raced the join.
+        runner = orchestrator._runner
+        if runner is not None and runner._manager is not None:
+            try:
+                runner._manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
 
 
 def test_monitor_loop_does_not_return_while_sibling_running(tmp_path: Path) -> None:
@@ -199,24 +215,31 @@ def test_monitor_loop_does_not_return_while_sibling_running(tmp_path: Path) -> N
 
     thread = threading.Thread(target=_monitor, daemon=True)
     thread.start()
+    try:
+        # Wait until crash is observed, then assert monitor is still running.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if manager.state_of("crash") == ServiceState.FAILED:
+                break
+            time.sleep(0.05)
+        assert manager.state_of("crash") == ServiceState.FAILED
+        assert manager.state_of("ok") == ServiceState.RUNNING
+        assert not done.is_set(), "monitor returned while sibling still running"
 
-    # Wait until crash is observed, then assert monitor is still running.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if manager.state_of("crash") == ServiceState.FAILED:
-            break
-        time.sleep(0.05)
-    assert manager.state_of("crash") == ServiceState.FAILED
-    assert manager.state_of("ok") == ServiceState.RUNNING
-    assert not done.is_set(), "monitor returned while sibling still running"
+        issue = tmp_path / "issues" / "crash.issue"
+        assert issue.is_file()
+        text = issue.read_text(encoding="utf-8")
+        assert "app.py:9" in text or "boom" in text or "Service crashed" in text
 
-    issue = tmp_path / "issues" / "crash.issue"
-    assert issue.is_file()
-    text = issue.read_text(encoding="utf-8")
-    assert "app.py:9" in text or "boom" in text or "Service crashed" in text
-
-    manager.stop("ok")
-    assert done.wait(timeout=5.0), "monitor did not return after all services finished"
-    assert exit_code["code"] == 1
-    runner.unbind()
-    logger.close()
+        manager.stop("ok")
+        assert done.wait(timeout=5.0), "monitor did not return after all services finished"
+        assert exit_code["code"] == 1
+    finally:
+        try:
+            manager.stop_all(timeout_s=0.1)
+        except Exception:
+            pass
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        runner.unbind()
+        logger.close()

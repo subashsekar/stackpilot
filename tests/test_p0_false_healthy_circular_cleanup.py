@@ -528,29 +528,48 @@ class TestProcessCleanup:
         )
         managed = manager.start(list(stack.services)[0])
         pid = managed.pid
-        orch._runner = real_runner
-        orch._logger = logger
-        orch._watch_manager = watch
-        orch._cleanup_done = False
+        try:
+            orch._runner = real_runner
+            orch._logger = logger
+            orch._watch_manager = watch
+            orch._cleanup_done = False
 
-        calls = {"n": 0}
-        original = real_runner.shutdown
+            calls = {"n": 0}
+            original = real_runner.shutdown
 
-        def flaky(logger_, *, force: bool = False) -> int:  # noqa: ANN001
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise KeyboardInterrupt
-            return original(logger_, force=True)
+            def flaky(logger_, *, force: bool = False) -> int:  # noqa: ANN001
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise KeyboardInterrupt
+                return original(logger_, force=True)
 
-        real_runner.shutdown = flaky  # type: ignore[method-assign]
-        code = orch.stop()
-        assert orch._cleanup_done is True
-        assert code in {0, 1, 130}
-        if pid is not None:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and pid_is_alive(pid):
-                time.sleep(0.05)
-            assert not pid_is_alive(pid)
+            real_runner.shutdown = flaky  # type: ignore[method-assign]
+            code = orch.stop()
+            assert orch._cleanup_done is True
+            assert code in {0, 1, 130}
+            if pid is not None:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and pid_is_alive(pid):
+                    time.sleep(0.05)
+                assert not pid_is_alive(pid)
+        finally:
+            try:
+                manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
+            try:
+                watch.stop()
+            except Exception:
+                pass
+            try:
+                real_runner.unbind()
+            except Exception:
+                pass
+            logger.close()
+            if pid is not None and pid_is_alive(pid):
+                from stackpilot.process_tree import signal_process_tree
+
+                signal_process_tree(int(pid), graceful=False)
 
     def test_abnormal_exit_reaped_no_zombie(self, tmp_path: Path) -> None:
         logger = Logger(tmp_path / "logs", service_names=["svc"], auto_cleanup=False)

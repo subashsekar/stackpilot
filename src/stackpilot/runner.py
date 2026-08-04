@@ -531,9 +531,12 @@ class Runner:
             logger.set_console_enabled(False)
             # Wait briefly for any in-flight reload to release its lock so we do
             # not stop a service mid-restart (orphan / double-stop races).
+            # Bound the wait: an unbounded acquire() hangs shutdown (and CI) when
+            # a reload is blocked inside health polling.
             for lock in list(self._reload_locks.values()):
-                lock.acquire()
-                lock.release()
+                acquired = lock.acquire(timeout=5.0)
+                if acquired:
+                    lock.release()
 
         began = time.monotonic()
         # Only target services that are still live (supports re-entrant resume).

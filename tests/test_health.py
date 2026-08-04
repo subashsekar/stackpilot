@@ -56,8 +56,12 @@ def _serve_http_until(*, ready_after_s: float, stop: threading.Event) -> str:
     thread.start()
 
     def _shutdown() -> None:
-        stop.wait()
-        server.shutdown()
+        # Bound wait so a leaked Event cannot pin a helper thread forever.
+        stop.wait(timeout=120.0)
+        try:
+            server.shutdown()
+        except Exception:
+            pass
 
     threading.Thread(target=_shutdown, daemon=True).start()
     return f"http://127.0.0.1:{port}"

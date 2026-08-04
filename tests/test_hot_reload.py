@@ -161,19 +161,21 @@ def test_debounce_collapses_bursts_to_single_restart(tmp_path: Path) -> None:
         debounce_s=0.15,
         ignore=IgnoreMatcher(tmp_path, load_ignore_file=False),
     )
-    # Do not start the Observer — drive the handler directly.
-    target = tmp_path / "app.py"
-    target.write_text("v1", encoding="utf-8")
+    try:
+        # Do not start the Observer — drive the handler directly.
+        target = tmp_path / "app.py"
+        target.write_text("v1", encoding="utf-8")
 
-    for _ in range(5):
-        watcher.notify_for_tests(target)
-        time.sleep(0.02)
+        for _ in range(5):
+            watcher.notify_for_tests(target)
+            time.sleep(0.02)
 
-    assert done.wait(timeout=2.0)
-    time.sleep(0.25)
-    assert events == ["api"]
-    assert watcher.handler.fire_count == 1
-    watcher.stop()
+        assert done.wait(timeout=2.0)
+        time.sleep(0.25)
+        assert events == ["api"]
+        assert watcher.handler.fire_count == 1
+    finally:
+        watcher.stop()
 
 
 def test_forget_tree_clears_descendant_signatures_cross_platform(tmp_path: Path) -> None:
@@ -467,33 +469,34 @@ def test_health_check_after_restart(tmp_path: Path) -> None:
         health_check={"type": "process", "interval": 0.05, "timeout": 5},
         reload=True,
     )
-    managed = manager.start(spec)
-    elapsed = Health.wait_until_healthy(
-        "api", spec.health_check, process=managed.process
-    )
-    assert elapsed >= 0
+    try:
+        managed = manager.start(spec)
+        elapsed = Health.wait_until_healthy(
+            "api", spec.health_check, process=managed.process
+        )
+        assert elapsed >= 0
 
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline and marker.read_text(encoding="utf-8").strip() == "0":
-        time.sleep(0.05)
-    assert marker.read_text(encoding="utf-8").strip() == "1"
-    old_pid = managed.pid
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and marker.read_text(encoding="utf-8").strip() == "0":
+            time.sleep(0.05)
+        assert marker.read_text(encoding="utf-8").strip() == "1"
+        old_pid = managed.pid
 
-    runner = Runner(logs_dir=tmp_path / "logs")
-    runner._manager = manager
-    runner._reload_locks = {"api": threading.Lock()}
-    ok = runner._restart_with_health(manager, spec)
-    assert ok is True
-    assert manager.get("api").state == ServiceState.RUNNING
-    assert manager.get("api").pid != old_pid
+        runner = Runner(logs_dir=tmp_path / "logs")
+        runner._manager = manager
+        runner._reload_locks = {"api": threading.Lock()}
+        ok = runner._restart_with_health(manager, spec)
+        assert ok is True
+        assert manager.get("api").state == ServiceState.RUNNING
+        assert manager.get("api").pid != old_pid
 
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline and marker.read_text(encoding="utf-8").strip() != "2":
-        time.sleep(0.05)
-    assert marker.read_text(encoding="utf-8").strip() == "2"
-
-    manager.stop("api")
-    logger.close()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and marker.read_text(encoding="utf-8").strip() != "2":
+            time.sleep(0.05)
+        assert marker.read_text(encoding="utf-8").strip() == "2"
+    finally:
+        manager.stop_all(timeout_s=0.5)
+        logger.close()
 
 
 def test_restart_failure_isolation(tmp_path: Path, monkeypatch) -> None:
@@ -525,32 +528,33 @@ def test_restart_failure_isolation(tmp_path: Path, monkeypatch) -> None:
         reload=True,
     )
 
-    manager.start(ok_spec)
-    manager.start(
-        ServiceSpec(
-            name="bad",
-            path=tmp_path,
-            command='python -c "import time; time.sleep(30)"',
-            health_check={"type": "process", "interval": 0.05, "timeout": 5},
-            reload=True,
+    try:
+        manager.start(ok_spec)
+        manager.start(
+            ServiceSpec(
+                name="bad",
+                path=tmp_path,
+                command='python -c "import time; time.sleep(30)"',
+                health_check={"type": "process", "interval": 0.05, "timeout": 5},
+                reload=True,
+            )
         )
-    )
 
-    # Swap in a health check that will fail after restart.
-    managed_bad = manager.get("bad")
-    managed_bad.spec = bad_spec
+        # Swap in a health check that will fail after restart.
+        managed_bad = manager.get("bad")
+        managed_bad.spec = bad_spec
 
-    runner = Runner(logs_dir=tmp_path / "logs")
-    runner._manager = manager
-    runner._reload_locks = {"ok": threading.Lock(), "bad": threading.Lock()}
+        runner = Runner(logs_dir=tmp_path / "logs")
+        runner._manager = manager
+        runner._reload_locks = {"ok": threading.Lock(), "bad": threading.Lock()}
 
-    ok = runner._restart_with_health(manager, bad_spec)
-    assert ok is False
-    assert manager.get("ok").state == ServiceState.RUNNING
-    assert any("failed health check after reload" in line for line in printed)
-
-    manager.stop_all()
-    logger.close()
+        ok = runner._restart_with_health(manager, bad_spec)
+        assert ok is False
+        assert manager.get("ok").state == ServiceState.RUNNING
+        assert any("failed health check after reload" in line for line in printed)
+    finally:
+        manager.stop_all(timeout_s=0.5)
+        logger.close()
 
 
 def test_runner_launches_watch_manager_and_reloads(
