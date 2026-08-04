@@ -72,6 +72,7 @@ class NodeDisplay:
     status: str
     port: Optional[int] = None
     framework: str = ""
+    language: str = ""
     external: bool = False
     display_name: str = ""
 
@@ -98,6 +99,8 @@ class _RenderContext:
     nodes: Mapping[str, NodeDisplay]
     visited: Set[str] = field(default_factory=set)
     unicode: bool = True
+    cycle_names: Set[str] = field(default_factory=set)
+    compact: bool = False
 
 
 def collect_node_displays(
@@ -106,12 +109,14 @@ def collect_node_displays(
     statuses: Mapping[str, str] | None = None,
     ports: Mapping[str, Optional[int]] | None = None,
     frameworks: Mapping[str, str] | None = None,
+    languages: Mapping[str, str] | None = None,
 ) -> Dict[str, NodeDisplay]:
     """Build display metadata for every node in ``graph``."""
 
     statuses = statuses or {}
     ports = ports or {}
     frameworks = frameworks or {}
+    languages = languages or {}
     nodes: Dict[str, NodeDisplay] = {}
 
     for name, spec in graph.specs.items():
@@ -122,11 +127,15 @@ def collect_node_displays(
         framework = (frameworks.get(name) or "").strip()
         if not framework:
             framework = _detect_framework_label(spec)
+        language = (languages.get(name) or "").strip()
+        if not language:
+            language = _language_for_framework(framework, spec.command)
         nodes[name] = NodeDisplay(
             name=name,
             status=status,
             port=port,
             framework=framework,
+            language=language,
             external=False,
             display_name=name,
         )
@@ -138,6 +147,7 @@ def collect_node_displays(
             status=STATUS_EXTERNAL,
             port=int(port) if port is not None else None,
             framework="",
+            language="",
             external=True,
             display_name=dep.display_name or external_dependency_display_name(dep.type, name),
         )
@@ -147,11 +157,13 @@ def collect_node_displays(
 
 def find_root_names(graph: DependencyGraph) -> List[str]:
     """
-    Return nodes that nothing else depends on (architecture entry points).
+    Return application entry points (nothing else depends on them).
 
-    Application services are listed first (registration order), then external
-    roots. When every node has an incoming edge (should not happen on a valid
-    DAG), fall back to application service names so the tree still renders.
+    External dependencies are never tree roots — they render under the
+    dedicated External Infrastructure section to avoid clutter on large
+    stacks. When every application has an incoming edge (should not happen
+    on a valid DAG), fall back to all application names so the tree still
+    renders.
     """
 
     depended_on: Set[str] = set()
@@ -159,13 +171,11 @@ def find_root_names(graph: DependencyGraph) -> List[str]:
         depended_on.update(deps)
 
     app_roots = [name for name in graph.specs if name not in depended_on]
-    ext_roots = [name for name in graph.external if name not in depended_on]
-    roots = app_roots + ext_roots
-    if roots:
-        return roots
+    if app_roots:
+        return app_roots
     if graph.specs:
         return list(graph.specs.keys())
-    return list(graph.names)
+    return []
 
 
 def dependency_depth(graph: DependencyGraph) -> int:
@@ -224,7 +234,7 @@ def compute_stats(
     if cycle:
         # Unique members excluding the repeated closing node.
         members = list(dict.fromkeys(cycle[:-1] if len(cycle) > 1 and cycle[0] == cycle[-1] else cycle))
-        cycles = " → ".join(members) if members else "Detected"
+        cycles = " -> ".join(members) if members else "Detected"
 
     return ArchitectureStats(
         services=len(graph.specs),
@@ -274,32 +284,200 @@ def format_architecture_report(
     statuses: Mapping[str, str] | None = None,
     ports: Mapping[str, Optional[int]] | None = None,
     frameworks: Mapping[str, str] | None = None,
+    languages: Mapping[str, str] | None = None,
     color: bool = False,
     unicode: bool = True,
+    cycle: Sequence[str] | None = None,
 ) -> str:
     """
     Full professional architecture visualization.
 
-    Includes header stats, dependency tree, and footer. Does not validate the
-    graph — callers should handle cycles separately when desired.
+    Separates Applications (dependency tree of app services), External
+    Infrastructure (grouped once), and Connections (edge list). Never
+    raises — rendering failures degrade to a minimal safe report.
     """
 
-    nodes = collect_node_displays(
+    try:
+        nodes = collect_node_displays(
+            graph,
+            statuses=statuses,
+            ports=ports,
+            frameworks=frameworks,
+            languages=languages,
+        )
+        cycle_names = _cycle_name_set(cycle)
+        stats = compute_stats(graph, nodes, cycle=cycle)
+        apps = format_applications_section(
+            graph,
+            nodes=nodes,
+            unicode=unicode,
+            cycle_names=cycle_names,
+        )
+        externals = format_external_infrastructure(graph, nodes=nodes, unicode=unicode)
+        connections = format_connections(graph, unicode=unicode)
+        startup = format_startup_order(graph, unicode=unicode)
+
+        header = _format_header(stats, unicode=unicode)
+        footer = _format_footer(stats, unicode=unicode)
+        legend = _format_legend(unicode=unicode)
+        sections = [header, "", apps]
+        if externals:
+            sections.extend(["", externals])
+        if connections:
+            sections.extend(["", connections])
+        sections.extend(["", startup, "", legend, "", footer])
+        body = "\n".join(sections)
+
+        if color:
+            return _colorize_report(body, nodes)
+        return body
+    except Exception:
+        # Graph rendering must never crash the CLI (cp1252, deep trees, etc.).
+        try:
+            names = ", ".join(graph.specs.keys()) or "(none)"
+            ext = ", ".join(graph.external.keys()) or "(none)"
+            return (
+                "StackPilot Architecture\n"
+                f"Applications: {names}\n"
+                f"External Infrastructure: {ext}\n"
+                "Graph Generated Successfully\n"
+            )
+        except Exception:
+            return "StackPilot Architecture\nGraph Generated Successfully\n"
+
+
+def format_startup_order(graph: DependencyGraph, *, unicode: bool = True) -> str:
+    """Render topological startup order for application services."""
+
+    try:
+        ordered = [
+            name for name in graph.topological_order() if name in graph.specs
+        ]
+    except Exception:
+        ordered = list(graph.specs.keys())
+
+    if not ordered:
+        return "Startup order: (none)"
+
+    arrow = " → " if unicode else " -> "
+    return "Startup order: " + arrow.join(ordered)
+
+
+def format_applications_section(
+    graph: DependencyGraph,
+    *,
+    nodes: Mapping[str, NodeDisplay] | None = None,
+    unicode: bool = True,
+    cycle_names: Set[str] | None = None,
+) -> str:
+    """Render the Applications section (app-only dependency tree)."""
+
+    tree = format_dependency_tree(
         graph,
-        statuses=statuses,
-        ports=ports,
-        frameworks=frameworks,
+        nodes=nodes,
+        unicode=unicode,
+        cycle_names=cycle_names,
     )
-    stats = compute_stats(graph, nodes)
-    tree = format_dependency_tree(graph, nodes=nodes, unicode=unicode)
+    return "Applications\n" + (_RULE if unicode else _RULE_ASCII) + "\n" + tree
 
-    header = _format_header(stats, unicode=unicode)
-    footer = _format_footer(stats, unicode=unicode)
-    body = "\n".join(part for part in (header, "", tree, "", footer) if part is not None)
 
-    if color:
-        return _colorize_report(body, nodes)
-    return body
+def format_external_infrastructure(
+    graph: DependencyGraph,
+    *,
+    nodes: Mapping[str, NodeDisplay] | None = None,
+    unicode: bool = True,
+) -> str:
+    """Render grouped external infrastructure (once, never as tree roots)."""
+
+    if not graph.external:
+        return ""
+
+    display_nodes = nodes or collect_node_displays(graph)
+    lines = [
+        "External Infrastructure",
+        _RULE if unicode else _RULE_ASCII,
+    ]
+    for name in graph.external:
+        node = display_nodes.get(name) or NodeDisplay(
+            name=name, status=STATUS_EXTERNAL, external=True, display_name=name
+        )
+        lines.append(format_node_label(node, unicode=unicode))
+    return "\n".join(lines)
+
+
+def format_connections(graph: DependencyGraph, *, unicode: bool = True) -> str:
+    """
+    Render an explicit Connections list (app → deps).
+
+    Keeps large graphs readable: the tree shows structure; this section
+    enumerates every edge including links to external infrastructure.
+    For large stacks (50+ apps) the edge list is omitted / simplified to
+    reduce visual noise.
+    """
+
+    app_count = len(graph.specs)
+    if app_count >= 50:
+        # Simplify: show only external fan-in counts, not every edge.
+        return _format_simplified_connections(graph, unicode=unicode)
+
+    arrow = " → " if unicode else " -> "
+    rows: List[str] = []
+    for name in graph.specs:
+        deps = list(graph.edges.get(name, ()))
+        if not deps:
+            continue
+        labels: List[str] = []
+        for dep in deps:
+            if dep in graph.external:
+                ext = graph.external[dep]
+                labels.append(
+                    ext.display_name
+                    or external_dependency_display_name(ext.type, dep)
+                )
+            else:
+                labels.append(dep)
+        rows.append(f"{name}{arrow}{', '.join(labels)}")
+
+    if not rows:
+        return ""
+
+    return "\n".join(
+        [
+            "Connections",
+            _RULE if unicode else _RULE_ASCII,
+            *rows,
+        ]
+    )
+
+
+def _format_simplified_connections(
+    graph: DependencyGraph, *, unicode: bool
+) -> str:
+    """Compact connections summary for 50+ service graphs."""
+
+    ext_users: Dict[str, int] = {name: 0 for name in graph.external}
+    app_edges = 0
+    for name in graph.specs:
+        for dep in graph.edges.get(name, ()):
+            if dep in graph.external:
+                ext_users[dep] = ext_users.get(dep, 0) + 1
+            elif dep in graph.specs:
+                app_edges += 1
+
+    lines = [
+        "Connections",
+        _RULE if unicode else _RULE_ASCII,
+        f"Application edges : {app_edges} (simplified for {len(graph.specs)} services)",
+    ]
+    for name, count in ext_users.items():
+        if count <= 0:
+            continue
+        ext = graph.external[name]
+        label = ext.display_name or external_dependency_display_name(ext.type, name)
+        lines.append(f"{label} : used by {count} services")
+    if len(lines) == 3 and app_edges == 0:
+        return ""
+    return "\n".join(lines)
 
 
 def format_dependency_tree(
@@ -308,16 +486,21 @@ def format_dependency_tree(
     nodes: Mapping[str, NodeDisplay] | None = None,
     unicode: bool = True,
     prefer_rich: bool = False,
+    cycle_names: Set[str] | None = None,
 ) -> str:
-    """Render only the dependency tree (no header / footer)."""
+    """Render only the application dependency tree (no header / footer)."""
 
-    if not graph.names:
+    if not graph.specs:
+        if graph.external:
+            return "(no application services)"
         return "(no services)"
 
     display_nodes = nodes or collect_node_displays(graph)
+    cycles = cycle_names or set()
+    compact = len(graph.specs) >= 50
 
-    # No depends_on edges → independent roots (still status/port/framework),
-    # plus a short tip pointing at Stackfile wiring / sync inference.
+    # No depends_on edges between apps → independent roots (still
+    # status/port/framework). Externals live in their own section.
     if _has_no_app_edges(graph):
         return _format_ungraphed_services(graph, display_nodes, unicode=unicode)
 
@@ -327,22 +510,48 @@ def format_dependency_tree(
     # lines (│) that match the architecture mockup. Rich Tree is optional —
     # useful when callers want Rich's layout, but it drops those spacers and
     # can wrap deep labels once indentation exceeds the console width.
-    if prefer_rich and unicode and dependency_depth(graph) <= 24:
+    # Skip Rich for large graphs — manual walk is faster and more compact.
+    if (
+        prefer_rich
+        and unicode
+        and not compact
+        and dependency_depth(graph) <= 24
+        and not cycles
+    ):
         rendered = _render_with_rich_trees(graph, display_nodes, roots)
         if rendered is not None:
             return rendered
 
-    ctx = _RenderContext(graph=graph, nodes=display_nodes, unicode=unicode)
+    ctx = _RenderContext(
+        graph=graph,
+        nodes=display_nodes,
+        unicode=unicode,
+        cycle_names=cycles,
+        compact=compact,
+    )
     lines: List[str] = []
     for index, root in enumerate(roots):
         _append_unicode_subtree(lines, ctx, root, prefix="", is_root=True)
-        if index < len(roots) - 1:
+        # Breathing room between top-level roots; tighten on large graphs.
+        if index < len(roots) - 1 and not compact:
             lines.append("")
     return "\n".join(lines)
 
 
+def _cycle_name_set(cycle: Sequence[str] | None) -> Set[str]:
+    if not cycle:
+        return set()
+    return {str(name) for name in cycle if name}
+
+
 def _has_no_app_edges(graph: DependencyGraph) -> bool:
-    return all(not graph.edges.get(name, ()) for name in graph.specs)
+    """True when no application depends on another application."""
+
+    for name in graph.specs:
+        for dep in graph.edges.get(name, ()):
+            if dep in graph.specs:
+                return False
+    return True
 
 
 def _format_ungraphed_services(
@@ -352,29 +561,27 @@ def _format_ungraphed_services(
     unicode: bool,
 ) -> str:
     tip = (
-        "No depends_on edges in Stackfile.py — showing independent roots.\n"
+        "No depends_on edges in Stackfile.py - showing independent roots.\n"
         "Add depends_on=[...] or keep docker-compose / SERVICE_URL references "
         "so StackPilot can infer the graph (re-run: stackpilot sync --force)."
     )
     lines: List[str] = [tip, ""]
 
-    # Forest of roots: every application service, then orphan externals.
+    # Forest of application roots only — externals render in their section.
     for name in graph.specs:
         node = nodes.get(name) or NodeDisplay(name=name, status=STATUS_UNKNOWN)
         lines.append(format_node_label(node, unicode=unicode))
 
-    if graph.external:
-        if graph.specs:
-            lines.append("")
-        for name in graph.external:
-            node = nodes[name]
-            lines.append(format_node_label(node, unicode=unicode))
-
     return "\n".join(lines)
 
 
-def format_node_label(node: NodeDisplay, *, unicode: bool = True) -> str:
-    """Single-line label: glyph, name/port, optional framework."""
+def format_node_label(
+    node: NodeDisplay,
+    *,
+    unicode: bool = True,
+    in_cycle: bool = False,
+) -> str:
+    """Single-line label: glyph, name/port, optional framework / language / cycle."""
 
     glyphs = _STATUS_GLYPH if unicode else _STATUS_GLYPH_ASCII
     glyph = glyphs.get(node.status, glyphs[STATUS_UNKNOWN])
@@ -389,8 +596,18 @@ def format_node_label(node: NodeDisplay, *, unicode: bool = True) -> str:
         # greppability when the display name already equals the raw name.
         if title == node.name:
             parts.append("[external]")
-    elif node.framework:
-        parts.append(f"[{node.framework}]")
+    else:
+        meta: List[str] = []
+        if node.framework:
+            meta.append(node.framework)
+        if node.language:
+            meta.append(node.language)
+        if meta:
+            sep = " · " if unicode else " / "
+            parts.append(f"[{sep.join(meta)}]")
+
+    if in_cycle:
+        parts.append("[CYCLE]" if not unicode else "⚠ CYCLE")
 
     return " ".join(parts)
 
@@ -402,32 +619,54 @@ def format_node_label(node: NodeDisplay, *, unicode: bool = True) -> str:
 
 def _format_header(stats: ArchitectureStats, *, unicode: bool) -> str:
     rule = _RULE if unicode else _RULE_ASCII
-    return "\n".join(
-        [
-            "StackPilot Architecture",
-            rule,
-            "",
-            f"Services : {stats.services}",
-            f"Running  : {stats.running}",
-            f"Stopped  : {stats.stopped}",
-            f"FastAPI  : {stats.fastapi}",
-            f"Django   : {stats.django}",
-            f"Flask    : {stats.flask}",
-            f"Node     : {stats.node}",
-            f"External : {stats.external}",
-        ]
-    )
+    lines = [
+        "StackPilot Architecture",
+        rule,
+        "",
+        f"Services : {stats.services}",
+        f"Running  : {stats.running}",
+        f"Stopped  : {stats.stopped}",
+    ]
+    # Omit zero framework buckets — less noise on mixed / small stacks.
+    if stats.fastapi:
+        lines.append(f"FastAPI  : {stats.fastapi}")
+    if stats.django:
+        lines.append(f"Django   : {stats.django}")
+    if stats.flask:
+        lines.append(f"Flask    : {stats.flask}")
+    if stats.node:
+        lines.append(f"Node     : {stats.node}")
+    if stats.external:
+        lines.append(f"External : {stats.external}")
+    return "\n".join(lines)
+
+
+def _format_legend(*, unicode: bool) -> str:
+    """Status glyph legend for the architecture report."""
+
+    rule = _RULE if unicode else _RULE_ASCII
+    glyphs = _STATUS_GLYPH if unicode else _STATUS_GLYPH_ASCII
+    rows = [
+        f"{glyphs[STATUS_RUNNING]}  Running",
+        f"{glyphs[STATUS_STARTING]}  Starting / Reload",
+        f"{glyphs[STATUS_STOPPED]}  Stopped / Failed",
+        f"{glyphs[STATUS_EXTERNAL]}  External",
+        f"{glyphs[STATUS_UNKNOWN]}  Unknown",
+    ]
+    return "\n".join(["Legend", rule, *rows])
 
 
 def _format_footer(stats: ArchitectureStats, *, unicode: bool) -> str:
     rule = _RULE if unicode else _RULE_ASCII
+    cycles = stats.cycles
+    if unicode and " -> " in cycles:
+        cycles = cycles.replace(" -> ", " → ")
     return "\n".join(
         [
             rule,
             "",
-            f"Total Services         : {stats.services}",
             f"Dependency Depth       : {stats.depth}",
-            f"Circular Dependencies  : {stats.cycles}",
+            f"Circular Dependencies  : {cycles}",
             "",
             "Graph Generated Successfully",
         ]
@@ -440,16 +679,20 @@ def _format_footer(stats: ArchitectureStats, *, unicode: bool) -> str:
 
 
 def _visible_children(ctx: _RenderContext, name: str) -> List[str]:
-    """Children to render; omit already-shown external leaves."""
+    """
+    Application children to render under ``name``.
+
+    External dependencies are omitted from the tree — they appear once in
+    the External Infrastructure section and in Connections, which keeps
+    large (50+) graphs readable.
+    """
 
     visible: List[str] = []
     for child in ctx.graph.edges.get(name, ()):
         child_node = ctx.nodes.get(child)
-        if (
-            child in ctx.visited
-            and child_node is not None
-            and child_node.external
-        ):
+        if child_node is not None and child_node.external:
+            continue
+        if child in ctx.graph.external:
             continue
         visible.append(child)
     return visible
@@ -464,7 +707,11 @@ def _append_unicode_subtree(
     is_root: bool,
 ) -> None:
     node = ctx.nodes.get(name) or NodeDisplay(name=name, status=STATUS_UNKNOWN)
-    label = format_node_label(node, unicode=ctx.unicode)
+    label = format_node_label(
+        node,
+        unicode=ctx.unicode,
+        in_cycle=name in ctx.cycle_names,
+    )
 
     if is_root:
         lines.append(label)
@@ -490,18 +737,23 @@ def _append_unicode_subtree(
         branch = elbow if is_last else tee
         child_node = ctx.nodes.get(child) or NodeDisplay(name=child, status=STATUS_UNKNOWN)
         reused = child in ctx.visited
-        child_label = format_node_label(child_node, unicode=ctx.unicode)
+        child_label = format_node_label(
+            child_node,
+            unicode=ctx.unicode,
+            in_cycle=child in ctx.cycle_names,
+        )
         if reused:
-            child_label = f"{child_label} ⋯"
+            marker = " ⋯" if ctx.unicode else " ..."
+            child_label = f"{child_label}{marker}"
         lines.append(f"{prefix}{branch}{child_label}")
 
         if reused:
-            if not is_last and prefix == "":
+            if not is_last and prefix == "" and not ctx.compact:
                 lines.append(f"{prefix}{spacer}")
             continue
 
         ctx.visited.add(child)
-        if ctx.graph.edges.get(child, ()):
+        if _visible_children(ctx, child):
             _append_children_only(
                 lines,
                 ctx,
@@ -510,7 +762,8 @@ def _append_unicode_subtree(
             )
 
         # Breathing room between top-level branches under a root.
-        if not is_last and prefix == "":
+        # Compact mode (50+ services) skips spacers to reduce clutter.
+        if not is_last and prefix == "" and not ctx.compact:
             lines.append(f"{prefix}{spacer}")
 
 
@@ -534,24 +787,29 @@ def _append_children_only(
         is_last = index == len(children) - 1
         branch = elbow if is_last else tee
         child_node = ctx.nodes.get(child) or NodeDisplay(name=child, status=STATUS_UNKNOWN)
-        child_label = format_node_label(child_node, unicode=ctx.unicode)
+        child_label = format_node_label(
+            child_node,
+            unicode=ctx.unicode,
+            in_cycle=child in ctx.cycle_names,
+        )
         reused = child in ctx.visited
         if reused:
-            child_label = f"{child_label} ⋯"
+            marker = " ⋯" if ctx.unicode else " ..."
+            child_label = f"{child_label}{marker}"
         lines.append(f"{prefix}{branch}{child_label}")
         if reused:
-            if not is_last and prefix == "":
+            if not is_last and prefix == "" and not ctx.compact:
                 lines.append(f"{prefix}{spacer}")
             continue
         ctx.visited.add(child)
-        if ctx.graph.edges.get(child, ()):
+        if _visible_children(ctx, child):
             _append_children_only(
                 lines,
                 ctx,
                 child,
                 prefix=f"{prefix}{blank if is_last else pipe}",
             )
-        if not is_last and prefix == "":
+        if not is_last and prefix == "" and not ctx.compact:
             lines.append(f"{prefix}{spacer}")
 
 
@@ -596,6 +854,11 @@ def _render_with_rich_trees(
         tree = Tree(Text(format_node_label(node, unicode=True)))
         visited.add(root)
         for child in graph.edges.get(root, ()):
+            child_node = nodes.get(child)
+            if child_node is not None and child_node.external:
+                continue
+            if child in graph.external:
+                continue
             _add_rich_child(tree, graph, nodes, child, visited, Tree=Tree, Text=Text)
         console.print(tree)
 
@@ -603,8 +866,8 @@ def _render_with_rich_trees(
     if not text:
         return None
 
-    # If wrapping still dropped a node name, prefer the manual Unicode walk.
-    for name in graph.names:
+    # If wrapping still dropped an application name, prefer the Unicode walk.
+    for name in graph.specs:
         if name not in text and (
             nodes.get(name) is None or nodes[name].display_name not in text
         ):
@@ -623,22 +886,20 @@ def _add_rich_child(
     Text,
 ) -> None:
     node = nodes.get(name) or NodeDisplay(name=name, status=STATUS_UNKNOWN)
+    if node.external or name in graph.external:
+        return
     label = format_node_label(node, unicode=True)
     if name in visited:
-        if node.external:
-            return
-        parent.add(Text(f"{label} ⋯"))
+        parent.add(Text(f"{label} ..."))
         return
 
     branch = parent.add(Text(label))
     visited.add(name)
     for child in graph.edges.get(name, ()):
         child_node = nodes.get(child)
-        if (
-            child in visited
-            and child_node is not None
-            and child_node.external
-        ):
+        if child_node is not None and child_node.external:
+            continue
+        if child in graph.external:
             continue
         _add_rich_child(branch, graph, nodes, child, visited, Tree=Tree, Text=Text)
 
@@ -737,10 +998,12 @@ def _detect_framework_label(spec: ServiceSpec) -> str:
     """
     Resolve a display framework label without touching discovery APIs.
 
-    Command heuristics win first (Stackfile is authoritative for how the
-    process is launched). Adapter match on ``spec.path`` is the fallback when
-    the command does not identify a framework. Results are cached per resolved
-    path because adapter detection may touch the filesystem.
+    Explicit command tokens win first (Stackfile is authoritative for how the
+    process is launched). Ambiguous Node launchers (``npm run start:dev``,
+    ``node main.js``, …) must not be hard-coded as Express — NestJS commonly
+    ships that shape. Adapter match on ``spec.path`` resolves those cases.
+    Results are cached per resolved path because adapter detection may touch
+    the filesystem.
     """
 
     command = (spec.command or "").lower()
@@ -754,11 +1017,49 @@ def _detect_framework_label(spec: ServiceSpec) -> str:
         return "Celery"
     if "nest" in command:
         return "NestJS"
-    if "express" in command or "node" in command or "npm" in command:
+    # Explicit ``express`` only — bare ``npm`` / ``node`` is ambiguous.
+    if "express" in command:
         return "Express"
 
+    # Ambiguous Node launchers (``npm run start:dev``, ``node main.js``, …):
+    # prefer NestJS/Express from the adapter registry so Nest is not mislabeled
+    # Express. Ignore non-Node adapter hits (e.g. monorepo root matching Celery).
+    if any(
+        token in command
+        for token in ("npm", "npx", "node", "pnpm", "yarn", "bun")
+    ):
+        label = _adapter_framework_label(spec.path)
+        if label in {"NestJS", "Express"}:
+            return label
+        return "Express"
+
+    label = _adapter_framework_label(spec.path)
+    if label:
+        return label
+    return ""
+
+
+def _language_for_framework(framework: str, command: str = "") -> str:
+    key = (framework or "").strip().lower()
+    if key in {"fastapi", "flask", "django", "celery", "uvicorn", "gunicorn", "python"}:
+        return "Python"
+    if key == "nestjs":
+        return "TypeScript"
+    if key in {"express", "node"}:
+        return "JavaScript"
     try:
-        path = Path(spec.path).expanduser().resolve()
+        from .status import detect_language
+
+        return detect_language(command, framework=framework)
+    except Exception:
+        return ""
+
+
+def _adapter_framework_label(service_path: str | Path) -> str:
+    """Return the matched application adapter name for ``service_path``, if any."""
+
+    try:
+        path = Path(service_path).expanduser().resolve()
     except OSError:
         return ""
 

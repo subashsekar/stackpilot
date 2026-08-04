@@ -13,6 +13,9 @@ prune **/.mypy_cache
 prune **/.ruff_cache
 prune **/.venv
 prune **/venv
+prune **/dist
+prune **/build
+prune **/_release_audit
 prune **/node_modules
 prune **/.stackpilot
 prune **/.vscode

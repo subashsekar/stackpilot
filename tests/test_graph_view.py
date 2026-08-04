@@ -79,7 +79,12 @@ class TestArchitectureReport:
         assert "Running  : 2" in report
         assert "FastAPI  : 4" in report
         assert "External : 1" in report
-        assert "🟢 gateway (:8000) [FastAPI]" in report
+        assert "Applications" in report
+        assert "External Infrastructure" in report
+        assert "Connections" in report
+        assert "🟢 gateway (:8000) [FastAPI · Python]" in report or (
+            "🟢 gateway (:8000) [FastAPI" in report and "Python" in report
+        )
         assert "PostgreSQL" in report
         assert "🔵" in report  # external dependency glyph
         assert "Graph Generated Successfully" in report
@@ -87,9 +92,17 @@ class TestArchitectureReport:
 
     def test_dedupes_shared_external(self) -> None:
         graph = build_graph(_stack_diamond())
+        report = format_architecture_report(graph)
+        # Externals appear once in External Infrastructure; Connections may
+        # repeat the label per edge (that is intentional).
+        from stackpilot.graph_view import format_external_infrastructure
+
+        ext = format_external_infrastructure(graph)
+        assert ext.count("PostgreSQL") == 1
+        assert "External Infrastructure" in report
+        assert "Connections" in report
         tree = format_dependency_tree(graph)
-        # First occurrence is expanded; later shared external leaves are omitted.
-        assert tree.count("PostgreSQL") == 1
+        assert "PostgreSQL" not in tree
         assert "⋯" in tree  # shared app node (users under payments)
 
     def test_top_level_branch_spacers(self) -> None:
@@ -115,10 +128,13 @@ class TestArchitectureReport:
         tree = format_dependency_tree(graph)
         assert "independent roots" in tree
         assert "🟢 gateway" in tree or "🔴 gateway" in tree
-        assert "PostgreSQL" in tree
+        assert "PostgreSQL" not in tree  # externals are sectioned separately
         # No fake tree connectors when there are no edges.
         assert "├──" not in tree
         assert "└──" not in tree
+        report = format_architecture_report(graph)
+        assert "External Infrastructure" in report
+        assert "PostgreSQL" in report
 
 
 class TestCircularDisplay:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import sys
 
 import typer
 
@@ -46,7 +45,7 @@ def sync_project(
         else root / STACKFILE_NAME
     )
 
-    _echo("Scanning project...\n")
+    _echo("Scanning project...")
     services = scan_project(root)
     _print_discovered_services(services)
 
@@ -73,11 +72,12 @@ def sync_project(
         force=write_force,
     )
 
-    _echo(f"\nGenerated {destination.name}")
-    _echo(f"Found {len(services)} service{'s' if len(services) != 1 else ''}.")
+    count = len(services)
     _echo("")
-    _echo("Next:")
-    _echo("  stackpilot run")
+    _echo(f"Generated {destination.name}")
+    _echo(f"Found {count} service{'s' if count != 1 else ''}.")
+    _echo("")
+    _echo("Next: stackpilot run")
 
     return SyncResult(
         services=services,
@@ -94,19 +94,15 @@ def _print_discovered_services(services: list[ServiceInfo]) -> None:
         return
 
     for service in services:
-        message = f"\u2713 {service.name} ({service.framework})"
-        fallback = f"* {service.name} ({service.framework})"
+        message = f"✓ {service.name} ({service.framework})"
+        fallback = f"+ {service.name} ({service.framework})"
         _echo(message, fallback=fallback)
 
 
 def _echo(message: str, *, fallback: str | None = None) -> None:
-    encoding = sys.stdout.encoding or "utf-8"
-    try:
-        message.encode(encoding)
-    except UnicodeEncodeError:
-        typer.echo(
-            fallback or message.encode(encoding, errors="replace").decode(encoding)
-        )
-        return
+    from .dashboard import ascii_fallback_dx, print_safe
 
-    typer.echo(message)
+    print_safe(
+        message,
+        ascii_fallback=fallback or ascii_fallback_dx(message),
+    )

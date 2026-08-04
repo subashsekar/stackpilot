@@ -11,11 +11,13 @@ nestjs/
   app/
     package.json
     main.js
+    app.controller.ts
 ```
 
 The `start:dev` script runs a tiny HTTP server so the example works without a
 full Nest CLI toolchain. Detection still matches NestJS through package
-dependencies.
+dependencies. The controller declares `@Get("health")` so sync emits an HTTP
+health check at `/health` (TCP is used when no health route is present).
 
 ## Setup
 
@@ -31,7 +33,7 @@ cd examples/nestjs
 stackpilot run
 ```
 
-Health: `http://127.0.0.1:8000/`
+Health: `http://127.0.0.1:8005/health`
 
 ## Re-sync
 

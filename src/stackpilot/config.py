@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     Any,
     Literal,
@@ -160,8 +161,20 @@ class ServiceSpec:
     restart_dependents: bool = False
     # Optional display / DX port when health_check does not expose one.
     port: Optional[int] = None
+    # Explicit child-process env (never mutates the parent ``os.environ``).
+    env: Mapping[str, str] = field(default_factory=dict)
+    # Optional dotenv path relative to ``path`` (or absolute).
+    env_file: Optional[str] = None
 
     def __post_init__(self) -> None:
+        # Freeze env so callers cannot mutate after construction.
+        frozen_env = MappingProxyType(
+            {str(key): str(value) for key, value in dict(self.env).items()}
+        )
+        object.__setattr__(self, "env", frozen_env)
+        if self.env_file is not None:
+            object.__setattr__(self, "env_file", str(self.env_file))
+
         # Accept legacy mapping configs when tests / callers build ServiceSpec
         # directly instead of going through ``Stack.service()``.
         if self.health_check is None:
@@ -310,6 +323,8 @@ class Stack:
         reload_dirs: Sequence[str] | None = None,
         restart_dependents: bool = False,
         port: int | None = None,
+        env: Mapping[str, str] | None = None,
+        env_file: str | Path | None = None,
     ) -> "Stack":
         service_path = Path(path).expanduser()
         deps = tuple(depends_on) if depends_on else ()
@@ -326,6 +341,8 @@ class Stack:
                 reload_dirs=dirs,
                 restart_dependents=bool(restart_dependents),
                 port=int(port) if port is not None else None,
+                env=dict(env) if env else {},
+                env_file=str(env_file) if env_file is not None else None,
             )
         )
         return self

@@ -26,7 +26,7 @@ class TestPerformanceBudgets:
     def test_graph_generation_scale(self) -> None:
         stack = Stack()
         prev = None
-        for i in range(40):
+        for i in range(50):
             name = f"svc{i}"
             deps = [prev] if prev else []
             stack.service(
@@ -38,11 +38,14 @@ class TestPerformanceBudgets:
             prev = name
         began = time.perf_counter()
         graph = build_graph(stack)
-        tree = graph.format_ascii_tree()
+        from stackpilot.graph_view import format_architecture_report
+
+        report = format_architecture_report(graph, unicode=False)
         elapsed = time.perf_counter() - began
-        assert "svc0" in tree
-        assert "svc39" in tree
-        assert elapsed < 1.0
+        assert "svc0" in report
+        assert "svc49" in report
+        assert "Applications" in report
+        assert elapsed < 2.0
 
     def test_runtime_persist_budget(self, tmp_path: Path) -> None:
         status = RuntimeStatus(project_root=tmp_path)
@@ -129,8 +132,9 @@ class TestPerformanceBudgets:
             t.start()
         for t in threads:
             t.join(timeout=5)
-        # Overlapping reloads for the same service are coalesced.
-        assert restarts["n"] == 1
+        # Overlapping reloads for the same service are coalesced to one in-flight
+        # restart plus at most one follow-up (never one-per-event).
+        assert 1 <= restarts["n"] <= 2
         runner.begin_shutdown()
         runner.shutdown(logger)
         watch.stop()

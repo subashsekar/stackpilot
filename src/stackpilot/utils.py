@@ -114,12 +114,17 @@ def safe_echo(
     err: bool = False,
     fg: Optional[str] = None,
     ascii_fallback: Optional[str] = None,
+    nl: bool = True,
 ) -> None:
     """Print ``message``, falling back when the active console encoding cannot."""
 
     import typer
 
+    from .dashboard import ascii_fallback_dx
+
     encoding = (sys.stderr if err else sys.stdout).encoding or "utf-8"
+    if ascii_fallback is None:
+        ascii_fallback = ascii_fallback_dx(message)
     try:
         message.encode(encoding)
     except UnicodeEncodeError:
@@ -129,17 +134,17 @@ def safe_echo(
 
     try:
         if fg is None:
-            typer.echo(message, err=err)
+            typer.echo(message, err=err, nl=nl)
         else:
-            typer.secho(message, err=err, fg=fg)
+            typer.secho(message, err=err, fg=fg, nl=nl)
     except UnicodeEncodeError:
         fallback = ascii_fallback or message.encode(encoding, errors="replace").decode(
             encoding
         )
         if fg is None:
-            typer.echo(fallback, err=err)
+            typer.echo(fallback, err=err, nl=nl)
         else:
-            typer.secho(fallback, err=err, fg=fg)
+            typer.secho(fallback, err=err, fg=fg, nl=nl)
 
 
 def iter_text_lines(stream: IO[str]) -> Iterator[str]:
@@ -227,6 +232,8 @@ def materialize_stack_for_project(stack: Stack, project_root: Path) -> Stack:
             reload_dirs=spec.reload_dirs,
             restart_dependents=spec.restart_dependents,
             port=spec.port,
+            env=dict(spec.env),
+            env_file=spec.env_file,
         )
     for dep in stack.external_dependencies:
         resolved.external_dependency(

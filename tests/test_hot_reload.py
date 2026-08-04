@@ -264,7 +264,8 @@ def test_no_restart_for_unchanged_file_event_after_prime(tmp_path: Path) -> None
     watcher.handler.prime(tmp_path)
 
     watcher.notify_for_tests(path, event_type="modified")
-    time.sleep(0.2)
+    # Windows schedules a deferred recheck; wait past it.
+    time.sleep(0.4)
 
     assert events == []
     assert watcher.handler.fire_count == 0
@@ -632,11 +633,11 @@ def test_runner_launches_watch_manager_and_reloads(
     assert any("Starting application services..." in line for line in printed)
     assert any("Watching for changes..." in line for line in printed)
     assert any("Reloading api..." in line for line in printed)
-    assert any("reloaded" in line for line in printed)
+    assert any("reloaded" in line.lower() for line in printed)
     assert any(
-        "WARNING StackPilot detected changes in" in line and "touch.py" in line
-        for line in printed
+        "Detected change" in line for line in printed
     )
+    assert any("touch.py" in line for line in printed)
     del original_monitor
 
 
@@ -668,3 +669,143 @@ def test_dependents_helper_order() -> None:
     assert graph.dependents("db") == ["api", "web"]
     assert graph.dependents("api") == ["web"]
     assert graph.dependents("web") == []
+
+
+# ---------------------------------------------------------------------------
+# Real Observer integration (single / multiple / rapid edits)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "filename,content",
+    [
+        ("app.py", "print('changed')\n"),
+        ("app.js", "console.log(1)\n"),
+        ("app.ts", " const x = 1\n"),
+        ("app.json", '{"ok": true}\n'),
+        (".env", "FOO=bar\n"),
+    ],
+)
+def test_observer_single_edit_reloads(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    target = tmp_path / filename
+    target.write_text("initial\n", encoding="utf-8")
+    done = threading.Event()
+    fires: list[str] = []
+
+    def on_change(name: str, paths) -> None:
+        fires.append(name)
+        done.set()
+
+    watcher = ServiceWatcher(
+        "api",
+        [tmp_path],
+        on_change,
+        debounce_s=0.15,
+        ignore=IgnoreMatcher(tmp_path, load_ignore_file=False),
+    )
+    watcher.start()
+    try:
+        time.sleep(0.35)
+        done.clear()
+        fires.clear()
+        target.write_text(content, encoding="utf-8")
+        assert done.wait(timeout=3.0), f"no reload for {filename}"
+        assert fires == ["api"]
+    finally:
+        watcher.stop()
+
+
+def test_observer_multiple_edits_each_reload(tmp_path: Path) -> None:
+    files = {
+        "a.py": "1\n",
+        "b.js": "1\n",
+        "c.ts": "1\n",
+    }
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+
+    done = threading.Event()
+    fires: list[int] = []
+
+    def on_change(_name: str, _paths) -> None:
+        fires.append(1)
+        done.set()
+
+    watcher = ServiceWatcher(
+        "api",
+        [tmp_path],
+        on_change,
+        debounce_s=0.15,
+        ignore=IgnoreMatcher(tmp_path, load_ignore_file=False),
+    )
+    watcher.start()
+    try:
+        time.sleep(0.35)
+        for name in files:
+            done.clear()
+            before = len(fires)
+            (tmp_path / name).write_text("changed\n", encoding="utf-8")
+            assert done.wait(timeout=3.0), f"missed reload for {name}"
+            assert len(fires) == before + 1
+    finally:
+        watcher.stop()
+
+
+def test_observer_rapid_edits_single_reload(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("v0\n", encoding="utf-8")
+    done = threading.Event()
+    fires: list[int] = []
+
+    def on_change(_name: str, _paths) -> None:
+        fires.append(1)
+        done.set()
+
+    watcher = ServiceWatcher(
+        "api",
+        [tmp_path],
+        on_change,
+        debounce_s=0.25,
+        ignore=IgnoreMatcher(tmp_path, load_ignore_file=False),
+    )
+    watcher.start()
+    try:
+        time.sleep(0.35)
+        done.clear()
+        fires.clear()
+        for index in range(10):
+            target.write_text(f"v{index}\n", encoding="utf-8")
+            time.sleep(0.02)
+        assert done.wait(timeout=3.0)
+        time.sleep(0.4)
+        assert len(fires) == 1
+    finally:
+        watcher.stop()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Observer backend")
+def test_windows_observer_edit_after_prime(tmp_path: Path) -> None:
+    target = tmp_path / "svc.py"
+    target.write_text("x=1\n", encoding="utf-8")
+    done = threading.Event()
+    fires: list[int] = []
+
+    watcher = ServiceWatcher(
+        "api",
+        [tmp_path],
+        lambda _n, _p: (fires.append(1), done.set()),
+        debounce_s=0.15,
+        ignore=IgnoreMatcher(tmp_path, load_ignore_file=False),
+    )
+    watcher.start()
+    try:
+        time.sleep(0.4)
+        done.clear()
+        fires.clear()
+        target.write_text("x=2\n", encoding="utf-8")
+        assert done.wait(timeout=3.0)
+        assert fires == [1]
+    finally:
+        watcher.stop()

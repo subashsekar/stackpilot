@@ -3,16 +3,20 @@
 Minimal projects that demonstrate framework detection and a generated
 `Stackfile.py`.
 
-| Example | Framework | Service directory |
-|---------|-----------|-------------------|
-| [`minimal/`](minimal/) | Inline Python | `./app` |
-| [`fastapi/`](fastapi/) | FastAPI | `./api` |
-| [`flask/`](flask/) | Flask | `./web` |
-| [`django/`](django/) | Django | `./web` |
-| [`celery/`](celery/) | Celery | `./worker` |
-| [`express/`](express/) | Express | `./app` |
-| [`nestjs/`](nestjs/) | NestJS | `./app` |
-| [`external-deps/`](external-deps/) | FastAPI + Postgres/Redis | `./auth`, `./gateway` |
+HTTP framework examples use **unique preferred ports** (`8001`–`8007`) so they
+do not collide when run side by side. Ports come from each service's source
+(or `.env` / listen fallback) and are preserved by `stackpilot sync --force`.
+
+| Example | Framework | Service directory | Port |
+|---------|-----------|-------------------|------|
+| [`minimal/`](minimal/) | Inline Python | `./app` | — |
+| [`fastapi/`](fastapi/) | FastAPI | `./api` | `8001` |
+| [`flask/`](flask/) | Flask | `./web` | `8002` |
+| [`django/`](django/) | Django | `./web` | `8003` |
+| [`celery/`](celery/) | Celery | `./worker` | — |
+| [`express/`](express/) | Express | `./app` | `8004` |
+| [`nestjs/`](nestjs/) | NestJS | `./app` | `8005` |
+| [`external-deps/`](external-deps/) | FastAPI + Postgres/Redis | `./auth`, `./gateway` | `8006`, `8007` |
 
 ## Try one
 

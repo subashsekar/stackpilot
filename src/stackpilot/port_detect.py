@@ -6,7 +6,8 @@ import os
 import re
 import subprocess
 import sys
-from typing import List, Optional, Sequence, Union
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
 from .config import HttpHealthCheck, ServiceSpec, TcpHealthCheck
@@ -125,6 +126,459 @@ def listening_ports_for_pid(pid: int) -> List[int]:
         return _listening_ports_posix(pid)
     except Exception:
         return []
+
+
+def pids_listening_on_port(port: int) -> List[int]:
+    """Return unique PIDs that currently hold a TCP LISTEN on ``port``."""
+
+    port = int(port)
+    if not (1 <= port <= 65535):
+        return []
+    try:
+        if sys.platform == "win32":
+            return _pids_listening_on_port_windows(port)
+        return _pids_listening_on_port_posix(port)
+    except Exception:
+        return []
+
+
+def process_name_for_pid(pid: int) -> Optional[str]:
+    """
+    Best-effort executable / process name for ``pid``.
+
+    Returns a short label such as ``python.exe`` or ``python3`` when known,
+    otherwise ``None``. Never raises.
+    """
+
+    if pid <= 0:
+        return None
+    try:
+        if sys.platform == "win32":
+            return _process_name_windows(pid)
+        return _process_name_posix(pid)
+    except Exception:
+        return None
+
+
+def describe_port_owners(port: int) -> List[Tuple[int, str]]:
+    """
+    Return ``(pid, label)`` pairs for processes listening on ``port``.
+
+    ``label`` is the executable name when available, otherwise ``unknown``.
+    """
+
+    owners: List[Tuple[int, str]] = []
+    for pid in pids_listening_on_port(port):
+        name = process_name_for_pid(pid) or "unknown"
+        owners.append((int(pid), name))
+    return owners
+
+
+def _process_name_windows(pid: int) -> Optional[str]:
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == INVALID_HANDLE_VALUE or not snap:
+        return None
+
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    try:
+        if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            return None
+        target = int(pid)
+        while True:
+            if int(entry.th32ProcessID) == target:
+                name = str(entry.szExeFile or "").strip()
+                return name or None
+            if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snap)
+    return None
+
+
+def _process_name_posix(pid: int) -> Optional[str]:
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{int(pid)}/comm", encoding="utf-8") as handle:
+                name = handle.read().strip()
+            if name:
+                return name
+        except OSError:
+            pass
+        try:
+            target = os.readlink(f"/proc/{int(pid)}/exe")
+            if target:
+                return Path(target).name
+        except OSError:
+            pass
+
+    completed = subprocess.run(
+        ["ps", "-p", str(int(pid)), "-o", "comm="],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode == 0 and completed.stdout:
+        name = completed.stdout.strip().splitlines()[0].strip()
+        if name:
+            return Path(name).name
+    return None
+
+
+def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
+    """
+    Whether ``port`` is owned by ``root_pid`` or a descendant / process-group peer.
+
+    Returns:
+      ``True``  — a listener on ``port`` belongs to the StackPilot-spawned tree
+      ``False`` — a foreign process owns the listen socket
+      ``None``  — nothing is listening on ``port`` yet
+    """
+
+    if root_pid <= 0:
+        return None
+    owners = pids_listening_on_port(port)
+    if not owners:
+        return None
+    tree = _process_tree_pids(root_pid)
+    for owner in owners:
+        if owner in tree:
+            return True
+    return False
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    """PIDs in the spawned tree: root, descendants, and POSIX process-group peers."""
+
+    tree: set[int] = {int(root_pid)}
+    try:
+        tree.update(_descendant_pids(root_pid))
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        try:
+            pgid = os.getpgid(root_pid)
+            tree.update(_pids_in_process_group(pgid))
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return tree
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """Breadth-first children of ``root_pid`` (best-effort, cross-platform)."""
+
+    children_of = _parent_to_children_map()
+    found: set[int] = set()
+    queue = [int(root_pid)]
+    while queue:
+        current = queue.pop()
+        for child in children_of.get(current, ()):
+            if child in found or child == root_pid:
+                continue
+            found.add(child)
+            queue.append(child)
+    return found
+
+
+def _parent_to_children_map() -> dict[int, list[int]]:
+    mapping: dict[int, list[int]] = {}
+    try:
+        if sys.platform == "win32":
+            pairs = _windows_pid_ppid_pairs()
+        else:
+            pairs = _posix_pid_ppid_pairs()
+    except Exception:
+        return mapping
+    for pid, ppid in pairs:
+        mapping.setdefault(ppid, []).append(pid)
+    return mapping
+
+
+def _windows_pid_ppid_pairs() -> list[tuple[int, int]]:
+    """Return (pid, ppid) pairs via Toolhelp32 (no WMIC dependency)."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == INVALID_HANDLE_VALUE or not snap:
+        return []
+
+    pairs: list[tuple[int, int]] = []
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    try:
+        if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            return []
+        while True:
+            pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+            if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snap)
+    return pairs
+
+
+def _posix_pid_ppid_pairs() -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    if sys.platform.startswith("linux"):
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{name}/stat", encoding="utf-8") as handle:
+                        text = handle.read()
+                except OSError:
+                    continue
+                # pid (comm) state ppid ...
+                close = text.rfind(")")
+                if close < 0:
+                    continue
+                rest = text[close + 2 :].split()
+                if len(rest) < 2:
+                    continue
+                try:
+                    pairs.append((int(name), int(rest[1])))
+                except ValueError:
+                    continue
+            return pairs
+        except OSError:
+            pass
+    completed = subprocess.run(
+        ["ps", "-Ao", "pid=,ppid="],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return pairs
+    for line in completed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pairs.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            continue
+    return pairs
+
+
+def _pids_in_process_group(pgid: int) -> set[int]:
+    found: set[int] = set()
+    if pgid <= 0:
+        return found
+    if sys.platform.startswith("linux"):
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{name}/stat", encoding="utf-8") as handle:
+                        text = handle.read()
+                except OSError:
+                    continue
+                close = text.rfind(")")
+                if close < 0:
+                    continue
+                rest = text[close + 2 :].split()
+                # After state,ppid: pgrp is index 2 in rest (man proc_pid_stat)
+                if len(rest) < 3:
+                    continue
+                try:
+                    if int(rest[2]) == pgid:
+                        found.add(int(name))
+                except ValueError:
+                    continue
+            return found
+        except OSError:
+            pass
+    completed = subprocess.run(
+        ["ps", "-Ao", "pid=,pgid="],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return found
+    for line in completed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid, group = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if group == pgid:
+            found.add(pid)
+    return found
+
+
+def _pids_listening_on_port_windows(port: int) -> List[int]:
+    completed = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if not completed.stdout:
+        return []
+    pids: set[int] = set()
+    for line in completed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[0].upper() != "TCP":
+            continue
+        state = parts[3].upper() if len(parts) >= 5 else ""
+        if state not in {"LISTENING", "LISTEN"}:
+            continue
+        local = parts[1]
+        local_port = _port_from_local_addr(local)
+        if local_port != port:
+            continue
+        try:
+            pids.add(int(parts[-1]))
+        except ValueError:
+            continue
+    return sorted(pids)
+
+
+def _pids_listening_on_port_posix(port: int) -> List[int]:
+    completed = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    pids: set[int] = set()
+    if completed.returncode == 0 and completed.stdout:
+        for line in completed.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                pids.add(int(parts[1]))
+            except ValueError:
+                continue
+        if pids:
+            return sorted(pids)
+
+    if sys.platform.startswith("linux"):
+        return _pids_listening_on_port_linux_proc(port)
+    return sorted(pids)
+
+
+def _pids_listening_on_port_linux_proc(port: int) -> List[int]:
+    """Map listen inode(s) for ``port`` back to owning PIDs via /proc."""
+
+    inodes: set[int] = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            text = Path_read(table)
+        except OSError:
+            continue
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            if parts[3] != "0A":
+                continue
+            local = parts[1]
+            if ":" not in local:
+                continue
+            try:
+                local_port = int(local.rsplit(":", 1)[1], 16)
+            except ValueError:
+                continue
+            if local_port != port:
+                continue
+            try:
+                inodes.add(int(parts[9]))
+            except ValueError:
+                continue
+    if not inodes:
+        return []
+
+    pids: set[int] = set()
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            owned = _socket_inodes_for_pid(pid)
+            if owned & inodes:
+                pids.add(pid)
+    except OSError:
+        return []
+    return sorted(pids)
 
 
 def _listening_ports_windows(pid: int) -> List[int]:

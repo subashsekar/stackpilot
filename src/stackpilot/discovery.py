@@ -7,15 +7,11 @@ from typing import Optional
 
 STACKFILE_NAME = "Stackfile.py"
 
-MISSING_STACKFILE_MESSAGE = """No Stackfile.py found.
-
-Create one:
-
+MISSING_STACKFILE_MESSAGE = """Problem: No Stackfile.py found.
+Reason: StackPilot needs a Stackfile.py in this directory (or a parent) to know which services to run.
+Suggested fix:
   stackpilot init
   stackpilot sync
-
-Then start services:
-
   stackpilot run"""
 
 

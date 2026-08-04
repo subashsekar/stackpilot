@@ -36,7 +36,7 @@ a clean environment, and verifies `stackpilot` / `python -m stackpilot`.
 - **Config file:** projects use `Stackfile.py` — never `stackpilot.py` (that name
   would shadow the installed package).
 - **CLI (frozen until v0.2.0):** do not add, rename, or remove public commands
-  (`init`, `sync`, `run`, `graph`, `status`, `ps`, `issues`, `doctor`,
+  (`init`, `sync`, `run`, `stop`, `graph`, `status`, `ps`, `issues`, `doctor`,
   `version`). Discovery should not require a `-c` / `--config` flag.
 - **Architecture:** keep the CLI → discovery → Orchestrator → Runner →
   ProcessManager layering. Runtime artifacts always live under the discovered

@@ -7,8 +7,17 @@ from typing import Optional, Sequence
 
 from .config import Stack
 from .dashboard import ascii_fallback_dx, print_safe
-from .dependency_graph import DependencyError, DependencyGraph, build_graph
-from .diagnostics.errors import format_spawn_failure, format_user_error
+from .dependency_graph import (
+    CircularDependencyError,
+    DependencyError,
+    DependencyGraph,
+    build_graph,
+)
+from .diagnostics.errors import (
+    format_circular_dependency_error,
+    format_spawn_failure,
+    format_user_error,
+)
 from .external_validation import (
     ExternalDependencyError,
     validate_external_dependencies,
@@ -80,6 +89,22 @@ class Orchestrator:
 
         try:
             ordered = self._ordered_services(stack, target=target)
+        except CircularDependencyError as exc:
+            # Must run before ValueError — DependencyError subclasses ValueError.
+            message = format_circular_dependency_error(exc.cycle)
+            print_safe(message, ascii_fallback=ascii_fallback_dx(message))
+            return 1
+        except DependencyError as exc:
+            message = format_user_error(
+                problem="Dependency error",
+                reason=str(exc),
+                suggested_fix=(
+                    "Fix depends_on= in Stackfile.py so every name refers to a "
+                    "registered service, then re-run."
+                ),
+            )
+            print_safe(message, ascii_fallback=ascii_fallback_dx(message))
+            return 1
         except ValueError as exc:
             message = format_user_error(
                 problem="Configuration error",
@@ -172,6 +197,9 @@ class Orchestrator:
                     runner.on_reload,
                     project_root=runner.project_root,
                 )
+                runner.print_watch_ready(
+                    watching=bool(watch_manager.watched_services)
+                )
                 exit_code = runner.monitor()
         except KeyboardInterrupt:
             exit_code = self.stop()
@@ -260,11 +288,30 @@ class Orchestrator:
             if watch_manager is not None:
                 _stage(watch_manager.stop)
 
+            # Capture project root before unbind clears it.
+            project_root = None
+            if runner is not None:
+                project_root = getattr(runner, "_project_root", None)
+                if project_root is None:
+                    try:
+                        project_root = runner.status.project_root
+                    except Exception:
+                        project_root = None
+
             # 4. Unbind runtime collaborators.
             if runner is not None:
                 _stage(runner.unbind)
 
-            # 5. Logger shutdown.
+            # 5. Clear runtime.json session after processes are down.
+            if project_root is not None:
+                def _clear() -> None:
+                    from .runtime_control import clear_runtime_session
+
+                    clear_runtime_session(project_root)
+
+                _stage(_clear)
+
+            # 6. Logger shutdown.
             if logger is not None:
                 _stage(logger.close)
         finally:

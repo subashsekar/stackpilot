@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import ServiceSpec
-from .diagnostics.errors import format_user_error
+from .diagnostics.errors import format_cleanup_failure, format_user_error
 from .diagnostics.ports import is_port_in_use
 from .models import ServiceState, configured_port
+from .port_detect import pids_listening_on_port
 from .process_tree import signal_process_tree
 from .status import (
     load_runtime_snapshot,
@@ -26,9 +27,14 @@ __all__ = [
     "clear_runtime_session",
     "detect_stale_session",
     "format_stale_session_error",
+    "format_cleanup_failure",
     "read_runtime_payload",
+    "resolve_session_root",
     "stop_runtime_session",
+    "DEFAULT_STOP_TIMEOUT_S",
 ]
+
+DEFAULT_STOP_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +45,7 @@ class StopResult:
     already_dead: tuple[str, ...]
     message: str
     exit_code: int = 0
+    remaining_pids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,12 +99,48 @@ def read_runtime_payload(project_root: Path) -> _RuntimeRead:
     return _RuntimeRead(snapshot=data, raw_services=raw)
 
 
-def stop_runtime_session(project_root: Path) -> StopResult:
+def resolve_session_root(start: Path | None = None) -> Optional[Path]:
+    """
+    Locate the project root for ``stackpilot stop``.
+
+    Prefers the nearest ``Stackfile.py`` ancestor. Falls back to an ancestor
+    that owns ``.stackpilot/runtime.json`` so leftover sessions can still be
+    cleared after the Stackfile was removed. Returns ``None`` when neither
+    exists (caller prints ``No running StackPilot session.``).
+    """
+
+    origin = (start or Path.cwd()).expanduser().resolve()
+
+    from .discovery import find_stackfile
+
+    stackfile = find_stackfile(origin)
+    if stackfile is not None:
+        return stackfile.parent
+
+    for directory in (origin, *origin.parents):
+        if runtime_status_path(directory).is_file():
+            return directory
+    return None
+
+
+def stop_runtime_session(
+    project_root: Path,
+    *,
+    force: bool = False,
+    timeout_s: float = DEFAULT_STOP_TIMEOUT_S,
+) -> StopResult:
     """
     Terminate every process recorded in ``runtime.json``.
 
-    Uses process-group / Job-Object tree cleanup. Ignores already-dead PIDs,
-    clears stale runtime entries, and never raises.
+    Shutdown sequence:
+      1. Graceful tree signal (skipped when ``force=True``)
+      2. Wait up to ``timeout_s``
+      3. Force-kill remaining process trees
+      4. Verify PIDs exited
+      5. Verify recorded listening ports released
+      6. Clear ``runtime.json`` only when cleanup succeeds
+
+    Uses process-group / Job-Object tree cleanup. Never raises.
     """
 
     root = Path(project_root).expanduser().resolve()
@@ -113,24 +156,29 @@ def stop_runtime_session(project_root: Path) -> StopResult:
 
     if parsed.corrupted:
         clear_runtime_session(root)
+        from .diagnostics.errors import format_corrupted_runtime
+
         return StopResult(
             stopped_names=(),
             already_dead=(),
-            message=(
-                "Runtime status was corrupted and has been cleared.\n"
-                "No running StackPilot session."
-            ),
+            message=format_corrupted_runtime(cleared=True),
             exit_code=0,
         )
 
     stopped: List[str] = []
     already_dead: List[str] = []
     lines: List[str] = []
+    tracked_pids: List[int] = []
+    tracked_ports: List[int] = []
+    grace = 0.05 if force else max(0.0, float(timeout_s))
 
     for raw in parsed.raw_services:
         name = str(raw.get("name") or "").strip() or "service"
         pid = raw.get("pid")
-        status = str(raw.get("status") or "")
+        status = str(raw.get("status") or "").strip().lower()
+        port = raw.get("port")
+        if isinstance(port, int) and port > 0:
+            tracked_ports.append(port)
 
         alive = isinstance(pid, int) and pid_is_alive(pid)
         if not alive:
@@ -139,20 +187,49 @@ def stop_runtime_session(project_root: Path) -> StopResult:
                 already_dead.append(name)
             continue
 
+        assert isinstance(pid, int)
+        tracked_pids.append(pid)
         lines.append(f"Stopping {name}...")
         try:
-            signal_process_tree(int(pid), graceful=True)
-            _wait_until_dead(int(pid), timeout_s=2.0)
-            if pid_is_alive(int(pid)):
-                signal_process_tree(int(pid), graceful=False)
-                _wait_until_dead(int(pid), timeout_s=2.0)
+            if not force:
+                signal_process_tree(pid, graceful=True)
+                _wait_until_dead(pid, timeout_s=grace)
+            if pid_is_alive(pid):
+                signal_process_tree(pid, graceful=False)
+                _wait_until_dead(pid, timeout_s=max(grace, DEFAULT_STOP_TIMEOUT_S))
         except Exception:
             # Best-effort: continue stopping other services.
             try:
-                signal_process_tree(int(pid), graceful=False)
+                signal_process_tree(pid, graceful=False)
+                _wait_until_dead(pid, timeout_s=DEFAULT_STOP_TIMEOUT_S)
             except Exception:
                 pass
         stopped.append(name)
+
+    # Final sweep — any still-live tracked PID gets a last force kill.
+    remaining = [pid for pid in tracked_pids if pid_is_alive(pid)]
+    for pid in remaining:
+        try:
+            signal_process_tree(pid, graceful=False)
+        except Exception:
+            pass
+        _wait_until_dead(pid, timeout_s=DEFAULT_STOP_TIMEOUT_S)
+
+    remaining = [pid for pid in tracked_pids if pid_is_alive(pid)]
+    held_ports = _ports_still_held(tracked_ports, remaining)
+
+    if remaining or held_ports:
+        # Keep runtime.json so a follow-up stop can retry.
+        message = format_cleanup_failure(remaining_pids=remaining)
+        if lines:
+            message = "\n".join([*lines, "", message])
+        return StopResult(
+            stopped_names=tuple(stopped),
+            already_dead=tuple(already_dead),
+            message=message,
+            exit_code=1,
+            remaining_pids=tuple(remaining),
+        )
 
     clear_runtime_session(root)
 
@@ -163,7 +240,8 @@ def stop_runtime_session(project_root: Path) -> StopResult:
         message = "No live StackPilot processes.\nCleared stale runtime status."
     else:
         summary = (
-            f"✓ {count} service{'s' if count != 1 else ''} stopped."
+            f"Stopped {count} service{'s' if count != 1 else ''}.\n"
+            "No orphan processes detected."
         )
         message = "\n".join([*lines, "", summary])
 
@@ -172,7 +250,16 @@ def stop_runtime_session(project_root: Path) -> StopResult:
         already_dead=tuple(already_dead),
         message=message,
         exit_code=0,
+        remaining_pids=(),
     )
+
+
+def format_cleanup_failure(*, remaining_pids: Sequence[int]) -> str:
+    """User-facing Problem / Reason / Suggested fix when stop leaves orphans."""
+
+    from .diagnostics.errors import format_cleanup_failure as _format
+
+    return _format(remaining_pids=remaining_pids)
 
 
 def clear_runtime_session(project_root: Path) -> None:
@@ -231,7 +318,7 @@ def detect_stale_session(
     for raw in services:
         name = str(raw.get("name") or "").strip()
         pid = raw.get("pid")
-        status = str(raw.get("status") or "")
+        status = str(raw.get("status") or "").strip().lower()
         if isinstance(pid, int) and status == ServiceState.RUNNING.value:
             if pid_is_alive(pid):
                 live.append(name or f"pid:{pid}")
@@ -295,12 +382,47 @@ def format_stale_session_error(stale: StaleSession) -> str:
             + ", ".join(str(p) for p in stale.occupied_ports)
         )
     extras.append("Or re-run with: stackpilot run --force")
+
+    reason_l = (stale.reason or "").lower()
+    if "corrupt" in reason_l:
+        return format_user_error(
+            problem="Corrupted runtime status",
+            reason=stale.reason,
+            suggested_fix="stackpilot stop",
+            extra_lines=extras,
+        )
+
     return format_user_error(
         problem="Existing StackPilot session detected.",
         reason=stale.reason,
         suggested_fix="stackpilot stop",
         extra_lines=extras,
     )
+
+
+def _ports_still_held(ports: Sequence[int], remaining_pids: Sequence[int]) -> List[int]:
+    """Return recorded ports that still have a live listener (orphans)."""
+
+    held: List[int] = []
+    remaining_set = {int(p) for p in remaining_pids}
+    for port in ports:
+        owners = pids_listening_on_port(int(port))
+        if not owners:
+            # Fallback bind probe when PID→port lookup is unavailable.
+            if is_port_in_use(port, host="127.0.0.1") or is_port_in_use(
+                port, host="0.0.0.0"
+            ):
+                # Only treat as held when we also failed to kill PIDs, or when
+                # a listener exists with no matching remaining tracked PID
+                # (true orphan listener). If all tracked PIDs are dead and a
+                # foreign process took the port, do not fail stop.
+                if remaining_set:
+                    held.append(int(port))
+            continue
+        # A listener owned by a still-live tracked PID is a cleanup failure.
+        if any(owner in remaining_set for owner in owners):
+            held.append(int(port))
+    return held
 
 
 def _wait_until_dead(pid: int, *, timeout_s: float) -> None:

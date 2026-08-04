@@ -14,7 +14,11 @@ End-user FAQ lives in the main README so there is a single source of truth:
 Topics covered there include:
 
 - `stackpilot stop` and stale session recovery (`run --force`)
+- Corrupted `.stackpilot/runtime.json` recovery
+- Parallel dependency-safe startup waves
+- Flask / Werkzeug informational log levels (not ERROR)
 - Flask automatic port reassignment (`flask run --port`)
 - MongoDB / RabbitMQ external dependency detection
 - NestJS HTTP `/health` (Terminus / controllers) with TCP fallback
+- Doctor runtime integrity / orphan / env-file checks
 - Ctrl+C shutdown, hot reload, Stackfile trust model, and the Issue Tracker

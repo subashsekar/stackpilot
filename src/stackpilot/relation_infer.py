@@ -7,6 +7,9 @@ Universal relation discovery for projects that lack an explicit Stackfile
 2. Inter-service URL / name references inside each service directory
    (``AUTH_SERVICE_URL``, ``auth_service_url``, ``http://auth_service:8001``,
    ``localhost:<peer-port>``, etc.)
+3. External infrastructure references (``REDIS_URL``, ``redis://``,
+   ``postgresql://``, ``mongodb://``, ``amqp://``, compose aliases, default
+   infra ports) mapped onto registered ``external_dependency`` names
 
 Does not change discovery or adapter matching — read-only filesystem scan.
 """
@@ -79,6 +82,55 @@ _COMPOSE_EXTERNAL_ALIASES: Mapping[str, str] = {
     "db": "postgres",
     "redis": "redis",
     "cache": "redis",
+    "mongodb": "mongodb",
+    "mongo": "mongodb",
+    "rabbitmq": "rabbitmq",
+    "amqp": "rabbitmq",
+}
+
+# URI scheme / type hint -> canonical external type key
+_EXTERNAL_SCHEME_TYPES: Mapping[str, str] = {
+    "redis": "redis",
+    "rediss": "redis",
+    "postgres": "postgres",
+    "postgresql": "postgres",
+    "mongodb": "mongodb",
+    "mongo": "mongodb",
+    "amqp": "rabbitmq",
+    "amqps": "rabbitmq",
+}
+
+# Well-known env / settings keys that imply an external dependency type.
+_EXTERNAL_ENV_KEYS: Mapping[str, str] = {
+    "REDIS_URL": "redis",
+    "REDIS_URI": "redis",
+    "CACHE_URL": "redis",
+    "CACHE_URI": "redis",
+    "POSTGRES_URL": "postgres",
+    "POSTGRES_URI": "postgres",
+    "POSTGRESQL_URL": "postgres",
+    "POSTGRESQL_URI": "postgres",
+    "PG_URL": "postgres",
+    "DATABASE_URL": "postgres",
+    "DB_URL": "postgres",
+    "MONGODB_URL": "mongodb",
+    "MONGODB_URI": "mongodb",
+    "MONGO_URL": "mongodb",
+    "MONGO_URI": "mongodb",
+    "AMQP_URL": "rabbitmq",
+    "AMQP_URI": "rabbitmq",
+    "RABBITMQ_URL": "rabbitmq",
+    "RABBITMQ_URI": "rabbitmq",
+    "BROKER_URL": "rabbitmq",
+    "CELERY_BROKER_URL": "rabbitmq",
+}
+
+# Default TCP ports for infrastructure when an external of that type exists.
+_EXTERNAL_DEFAULT_PORTS: Mapping[int, str] = {
+    6379: "redis",
+    5432: "postgres",
+    27017: "mongodb",
+    5672: "rabbitmq",
 }
 
 
@@ -102,9 +154,17 @@ def infer_service_dependencies(
     known_services = {spec.name: spec for spec in services}
     known_external_names = {dep.name for dep in externals}
     known_all = set(known_services) | known_external_names
+    type_to_external = _external_type_index(externals)
 
     port_to_service = _port_index(services)
+    # Include default infra ports when those externals are registered.
+    for port, type_key in _EXTERNAL_DEFAULT_PORTS.items():
+        mapped = type_to_external.get(type_key)
+        if mapped and port not in port_to_service:
+            port_to_service[port] = mapped
+
     aliases = _build_alias_index(known_services)
+    aliases.update(_build_external_alias_index(externals, type_to_external))
 
     result: Dict[str, List[str]] = {name: [] for name in known_services}
     compose_edges: Dict[str, List[str]] = {name: [] for name in known_services}
@@ -127,6 +187,8 @@ def infer_service_dependencies(
             aliases=aliases,
             port_to_service=port_to_service,
             self_name=spec.name,
+            known_external_names=known_external_names,
+            type_to_external=type_to_external,
         )
         for dep in found:
             if dep not in known_all or dep == spec.name:
@@ -190,7 +252,9 @@ def fill_missing_stack_dependencies(
 ) -> Stack:
     """
     Return a shallow-copied stack whose empty ``depends_on`` lists are filled
-    from catalog + inferred relations. Explicit Stackfile edges are preserved.
+    from catalog + inferred relations. Explicit Stackfile edges are preserved;
+    missing *external* dependency edges (redis/postgres/mongodb/rabbitmq) are
+    appended when inferred.
     """
 
     root = project_root.expanduser().resolve()
@@ -206,10 +270,20 @@ def fill_missing_stack_dependencies(
         services=resolved_services,
         external_dependencies=stack.external_dependencies,
     )
+    known_externals = {dep.name for dep in stack.external_dependencies}
 
     filled = Stack()
     for spec in stack.services:
-        deps = spec.depends_on if spec.depends_on else resolved.get(spec.name, ())
+        inferred = resolved.get(spec.name, ())
+        if spec.depends_on:
+            # Preserve explicit Stackfile edges; append any missing *external*
+            # deps so graph / run / doctor see redis/postgres/mongodb/rabbitmq.
+            deps = list(spec.depends_on)
+            for dep in inferred:
+                if dep in known_externals and dep not in deps:
+                    deps.append(dep)
+        else:
+            deps = list(inferred)
         filled._services.append(replace(spec, depends_on=tuple(deps)))
     for dep in stack.external_dependencies:
         filled._external_dependencies.append(dep)
@@ -233,6 +307,30 @@ def _port_index(services: Sequence[ServiceSpec]) -> Dict[int, str]:
     return index
 
 
+def _normalize_external_type(dep_type: str) -> str:
+    key = str(dep_type or "").strip().lower()
+    if key in _EXTERNAL_SCHEME_TYPES:
+        return _EXTERNAL_SCHEME_TYPES[key]
+    return _COMPOSE_EXTERNAL_ALIASES.get(key, key)
+
+
+def _external_type_index(
+    externals: Sequence[ExternalDependency],
+) -> Dict[str, str]:
+    """Map canonical type key (redis/postgres/...) -> registered external name."""
+
+    index: Dict[str, str] = {}
+    for dep in externals:
+        type_key = _normalize_external_type(dep.type)
+        if type_key and type_key not in index:
+            index[type_key] = dep.name
+        # Name itself often matches the type (redis, postgres, ...).
+        name_key = _normalize_external_type(dep.name)
+        if name_key and name_key not in index:
+            index[name_key] = dep.name
+    return index
+
+
 def _build_alias_index(services: Mapping[str, ServiceSpec]) -> Dict[str, str]:
     """
     Map normalized tokens -> canonical service name.
@@ -250,6 +348,31 @@ def _build_alias_index(services: Mapping[str, ServiceSpec]) -> Dict[str, str]:
             existing = aliases.get(token)
             if existing is None or len(name) >= len(existing):
                 aliases[token] = name
+    return aliases
+
+
+def _build_external_alias_index(
+    externals: Sequence[ExternalDependency],
+    type_to_external: Mapping[str, str],
+) -> Dict[str, str]:
+    """Map env keys / host tokens / type aliases -> external dependency name."""
+
+    aliases: Dict[str, str] = {}
+    for dep in externals:
+        for token in _alias_tokens(dep.name):
+            aliases.setdefault(token, dep.name)
+        type_key = _normalize_external_type(dep.type)
+        for alias_name, target_type in _COMPOSE_EXTERNAL_ALIASES.items():
+            if target_type == type_key or target_type == dep.name:
+                aliases.setdefault(alias_name, dep.name)
+                aliases.setdefault(alias_name.upper(), dep.name)
+
+    for env_key, type_key in _EXTERNAL_ENV_KEYS.items():
+        mapped = type_to_external.get(type_key)
+        if not mapped:
+            continue
+        aliases.setdefault(env_key, mapped)
+        aliases.setdefault(env_key.lower(), mapped)
     return aliases
 
 
@@ -296,6 +419,8 @@ def _scan_service_directory(
     aliases: Mapping[str, str],
     port_to_service: Mapping[int, str],
     self_name: str,
+    known_external_names: Set[str] | None = None,
+    type_to_external: Mapping[str, str] | None = None,
 ) -> List[str]:
     root = Path(spec.path).expanduser()
     try:
@@ -307,6 +432,8 @@ def _scan_service_directory(
 
     found: List[str] = []
     seen: Set[str] = set()
+    externals = known_external_names or set()
+    type_map = type_to_external or {}
 
     for path in _iter_scan_files(root):
         try:
@@ -320,6 +447,8 @@ def _scan_service_directory(
             aliases=aliases,
             port_to_service=port_to_service,
             self_name=self_name,
+            known_external_names=externals,
+            type_to_external=type_map,
         ):
             if dep not in seen:
                 seen.add(dep)
@@ -360,6 +489,11 @@ _HOST_NAME_RE = re.compile(
     r"https?://([A-Za-z0-9][A-Za-z0-9._-]{1,63})(?::\d{2,5})?\b",
     re.IGNORECASE,
 )
+_EXTERNAL_URI_RE = re.compile(
+    r"\b(redis|rediss|postgres|postgresql|mongodb|mongo|amqp|amqps)://"
+    r"(?:[^/\s\"']+@)?([A-Za-z0-9][A-Za-z0-9._-]{0,63})?(?::(\d{2,5}))?",
+    re.IGNORECASE,
+)
 _ENV_KEY_RE = re.compile(
     r"\b([A-Z][A-Z0-9_]*(?:SERVICE)?_?URL)\b",
 )
@@ -375,15 +509,26 @@ def _find_refs_in_text(
     aliases: Mapping[str, str],
     port_to_service: Mapping[int, str],
     self_name: str,
+    known_external_names: Set[str] | None = None,
+    type_to_external: Mapping[str, str] | None = None,
 ) -> List[str]:
     found: List[str] = []
     seen: Set[str] = set()
+    externals = known_external_names or set()
+    type_map = type_to_external or {}
 
     def add(name: Optional[str]) -> None:
         if not name or name == self_name or name in seen:
             return
         seen.add(name)
         found.append(name)
+
+    def add_external_type(type_key: Optional[str]) -> None:
+        if not type_key:
+            return
+        mapped = type_map.get(type_key) or aliases.get(type_key)
+        if mapped and mapped in externals:
+            add(mapped)
 
     for match in _URL_PORT_RE.finditer(text):
         port = int(match.group(1))
@@ -395,23 +540,68 @@ def _find_refs_in_text(
         add(aliases.get(host.replace("-", "_")))
         add(aliases.get(host.replace("_", "-")))
 
+    for match in _EXTERNAL_URI_RE.finditer(text):
+        scheme = match.group(1).lower()
+        host = (match.group(2) or "").lower()
+        port_raw = match.group(3)
+        add_external_type(_EXTERNAL_SCHEME_TYPES.get(scheme))
+        if host:
+            add(aliases.get(host))
+            add(aliases.get(host.replace("-", "_")))
+            mapped = _COMPOSE_EXTERNAL_ALIASES.get(host)
+            if mapped:
+                add_external_type(mapped)
+        if port_raw:
+            add(port_to_service.get(int(port_raw)))
+
     for match in _ENV_KEY_RE.finditer(text):
         key = match.group(1)
         add(aliases.get(key))
         add(aliases.get(key.lower()))
+        type_hint = _EXTERNAL_ENV_KEYS.get(key) or _EXTERNAL_ENV_KEYS.get(key.upper())
+        if type_hint:
+            # DATABASE_URL / BROKER_URL are ambiguous — only trust the key when
+            # a matching scheme already appears in the same text, or when the
+            # key is type-specific (REDIS_URL, MONGODB_URL, ...).
+            if key.upper() in {"DATABASE_URL", "DB_URL", "BROKER_URL", "CELERY_BROKER_URL"}:
+                if type_hint == "postgres" and not re.search(
+                    r"\b(?:postgres|postgresql)://", text, re.IGNORECASE
+                ):
+                    continue
+                if type_hint == "rabbitmq" and not re.search(
+                    r"\b(?:amqp|amqps|redis|rediss)://", text, re.IGNORECASE
+                ):
+                    continue
+                # Broker may be redis:// — scheme handler already added it.
+                if type_hint == "rabbitmq" and re.search(
+                    r"\b(?:redis|rediss)://", text, re.IGNORECASE
+                ):
+                    continue
+            add_external_type(type_hint)
 
     for match in _ATTR_RE.finditer(text):
         attr = match.group(1).lower()
         add(aliases.get(attr))
 
     # Bare service-name tokens (word boundaries) — keep conservative:
-    # only match underscored / dashed full names, not short stems like "auth".
+    # only match underscored / dashed full names for apps; allow bare
+    # external names (redis, postgres, mongodb, rabbitmq) when registered.
     for name, canonical in aliases.items():
         if canonical == self_name:
             continue
-        if "_" not in name and "-" not in name:
+        is_external = canonical in externals
+        if not is_external and "_" not in name and "-" not in name:
             continue
         if name.isupper() and name.endswith("_URL"):
+            continue
+        # Skip very short stems for externals to reduce false positives in
+        # comments ("db", "pg") — require the registered name or a compose alias.
+        if is_external and len(name) < 4 and name.lower() not in {
+            "redis",
+            "mongo",
+            "amqp",
+            "cache",
+        }:
             continue
         if re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", text):
             add(canonical)

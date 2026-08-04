@@ -27,7 +27,7 @@ cd examples/fastapi
 stackpilot run
 ```
 
-Health: `http://127.0.0.1:8000/health`
+Health: `http://127.0.0.1:8001/health`
 
 ## Re-sync
 

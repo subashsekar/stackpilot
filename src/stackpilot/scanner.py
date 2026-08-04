@@ -89,15 +89,19 @@ def scan_project(root: Path) -> list[ServiceInfo]:
     """
     Recursively discover microservice directories under ``root``.
 
-    The project root itself is never emitted as a service; only nested
-    directories are considered. Ignored directories are skipped entirely.
+    The project root itself is never emitted as an application service; only
+    nested directories are considered for apps. Root-level compose / infra
+    files still emit external dependencies (Postgres, Redis, MongoDB,
+    RabbitMQ) so monorepo ``docker-compose.yml`` next to ``Stackfile.py``
+    is discovered.
 
     Application matches prune descendants so inner packages (for example
     ``app/`` inside a FastAPI service) are not emitted as separate services.
 
-    External matches (Postgres / Redis) do **not** prune. Monorepo roots
-    often ship ``docker-compose.yml`` with Postgres while nesting real apps
-    underneath; those apps must still be discovered.
+    External matches do **not** prune. Monorepo roots often ship
+    ``docker-compose.yml`` with multiple infra images while nesting real
+    apps underneath; those apps must still be discovered. A single compose
+    file may match several external adapters at once.
     """
 
     project_root = root.expanduser().resolve()
@@ -108,6 +112,9 @@ def scan_project(root: Path) -> list[ServiceInfo]:
     # Resolved path keys — guarantees finite traversal under symlink cycles
     # (A→B, B→A) and nested link loops.
     visited: set[str] = set()
+
+    # Compose / conf at the sync root (never treated as an app folder).
+    detected.extend(_external_service_infos(project_root, prefer_canonical_names=True))
 
     def _walk(directory: Path) -> None:
         try:
@@ -130,12 +137,23 @@ def scan_project(root: Path) -> list[ServiceInfo]:
             if child.name in IGNORED_DIRECTORY_NAMES:
                 continue
 
+            try:
+                service_path = child.resolve()
+            except OSError:
+                continue
+
+            externals = _matching_external_adapters(child)
+            if externals:
+                detected.extend(
+                    _external_service_infos(
+                        child,
+                        prefer_canonical_names=len(externals) > 1,
+                        adapters=externals,
+                    )
+                )
+
             adapter = default_registry.match(child)
-            if adapter is not None:
-                try:
-                    service_path = child.resolve()
-                except OSError:
-                    continue
+            if adapter is not None and not adapter.external:
                 detected.append(
                     ServiceInfo(
                         name=child.name,
@@ -143,9 +161,19 @@ def scan_project(root: Path) -> list[ServiceInfo]:
                         framework=adapter.name,
                     )
                 )
-                if adapter.external:
-                    # Infrastructure tags the folder but does not own the tree.
-                    _walk(child)
+                # Application owns the tree — do not emit nested packages.
+                continue
+
+            if adapter is not None and adapter.external:
+                # Infrastructure tags the folder but does not own the tree.
+                # Externals (including multi-image compose) already recorded.
+                _walk(child)
+                continue
+
+            if externals:
+                # Compose-only folder with no single primary adapter match
+                # beyond the externals list — keep walking for nested apps.
+                _walk(child)
                 continue
 
             _walk(child)
@@ -154,20 +182,79 @@ def scan_project(root: Path) -> list[ServiceInfo]:
     return _finalize_detected_services(detected)
 
 
+def _matching_external_adapters(directory: Path) -> list[FrameworkAdapter]:
+    """Return every registered external adapter that detects ``directory``."""
+
+    return [
+        adapter
+        for adapter in default_registry.all()
+        if adapter.external and adapter.detect(directory)
+    ]
+
+
+def _external_service_infos(
+    directory: Path,
+    *,
+    prefer_canonical_names: bool,
+    adapters: list[FrameworkAdapter] | None = None,
+) -> list[ServiceInfo]:
+    """Build ``ServiceInfo`` rows for external adapters matching ``directory``."""
+
+    matched = adapters if adapters is not None else _matching_external_adapters(directory)
+    if not matched:
+        return []
+    try:
+        service_path = directory.resolve()
+    except OSError:
+        return []
+
+    use_canonical = prefer_canonical_names or len(matched) > 1
+    infos: list[ServiceInfo] = []
+    for adapter in matched:
+        name = (
+            _canonical_external_name(adapter)
+            if use_canonical
+            else directory.name
+        )
+        infos.append(
+            ServiceInfo(
+                name=name,
+                path=service_path,
+                framework=adapter.name,
+            )
+        )
+    return infos
+
+
 def _finalize_detected_services(services: list[ServiceInfo]) -> list[ServiceInfo]:
     """
     Clean up external matches that sit above nested discoveries.
 
+    - Drop duplicate (framework, path) rows from multi-adapter emission.
     - Drop an external when a descendant is the same infrastructure type
       (dedicated ``postgres/`` wins over compose-at-monorepo-root).
     - Rename remaining ancestor externals to canonical names (``postgres``,
-      ``redis``) so Stackfiles do not use the monorepo folder name.
+      ``redis``, ``mongodb``, ``rabbitmq``) so Stackfiles do not use the
+      monorepo folder name.
     """
 
     if not services:
         return services
 
-    resolved = [(service, service.path.resolve()) for service in services]
+    # Preserve first-seen order while dropping exact duplicates.
+    deduped: list[ServiceInfo] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for service in services:
+        try:
+            key = (service.framework, str(service.path.resolve()))
+        except OSError:
+            key = (service.framework, str(service.path))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(service)
+
+    resolved = [(service, service.path.resolve()) for service in deduped]
     kept: list[ServiceInfo] = []
 
     for service, path in resolved:
@@ -195,11 +282,20 @@ def _finalize_detected_services(services: list[ServiceInfo]) -> list[ServiceInfo
                 other_path != path and _is_under(other_path, path)
                 for _, other_path in resolved_kept
             )
-            if has_descendant:
+            # Same-path multi-infra (one compose, many adapters) must keep
+            # distinct canonical names even without nested app folders.
+            same_path_peers = sum(
+                1 for _, other_path in resolved_kept if other_path == path
+            )
+            if has_descendant or same_path_peers > 1:
                 name = _unique_name(
                     _canonical_external_name(adapter),
                     used_names,
                 )
+            else:
+                name = _unique_name(name, used_names)
+        else:
+            name = _unique_name(name, used_names)
         used_names.add(name)
         finalized.append(
             ServiceInfo(name=name, path=service.path, framework=service.framework)

@@ -32,6 +32,9 @@ build/
 .venv/
 venv/
 ENV/
+.install_venv/
+.test_venv/
+.release_venv/
 
 # Editors / OS
 .vscode/
@@ -49,3 +52,8 @@ scratch/
 experiment/
 draft/
 test_output/
+
+# Release hygiene (generated, not source)
+_release_audit/
+_audit_*.txt
+_audit_*.py

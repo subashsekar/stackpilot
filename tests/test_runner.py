@@ -34,10 +34,11 @@ def test_runner_prints_started_summary(tmp_path: Path, monkeypatch) -> None:
     assert code == 0
     joined = "\n".join(printed)
     assert "Starting application services..." in joined
+    assert "Started 2/2 services" in joined
     assert "Services ready:" in joined
     assert "http://127.0.0.1:8000" in joined
     assert "http://127.0.0.1:8001" in joined
-    assert "Watching for changes..." in joined
+    assert "Watching for changes..." not in joined  # no reload=True services
     assert "Press Ctrl+C to stop." in joined
     assert "All services are running." not in joined
 
@@ -69,9 +70,9 @@ def test_runner_reports_crash_without_tearing_down(
     assert code == 1
     joined = "\n".join(printed)
     assert "Starting application services..." in joined
-    assert "gateway exited (Exit Code: 1)" in joined
-    assert "Issue recorded:" in joined
-    assert "Remaining services continue running..." in joined
+    assert "gateway exited (exit 1)" in joined
+    assert "Issue:" in joined
+    assert "Remaining services continue running." in joined
     assert not any("Stopping StackPilot" in line for line in printed)
 
 

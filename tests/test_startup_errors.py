@@ -65,7 +65,7 @@ class TestFriendlyErrorFormat:
         problem, reason, fix = classify_spawn_error(exc)
         assert problem == "Port already in use"
         assert "bound" in reason.lower() or "port" in reason.lower()
-        assert "doctor" in fix
+        assert "stackpilot stop" in fix or "change the service port" in fix
 
     def test_spawn_invalid_command(self) -> None:
         problem, reason, fix = classify_spawn_error(ValueError("Service command is empty"))

@@ -128,7 +128,11 @@ def check_ports_in_use(
                 continue
             seen.add(key)
             if is_port_in_use(port, host=host):
-                occupied.append(f"{service} → {host}:{port}")
+                owner_detail = _owner_detail(port)
+                label = f"{service} → {host}:{port}"
+                if owner_detail:
+                    label = f"{label} ({owner_detail})"
+                occupied.append(label)
 
     if occupied:
         ctx.add(
@@ -136,7 +140,7 @@ def check_ports_in_use(
                 name="Ports available",
                 status=CheckStatus.WARN,
                 detail="Port(s) already in use: " + "; ".join(occupied),
-                fix="Stop the other process or change the service port.",
+                fix="Run stackpilot stop, or change the service port.",
             )
         )
         return
@@ -148,6 +152,26 @@ def check_ports_in_use(
             detail="Configured ports appear free",
         )
     )
+
+
+def _owner_detail(port: int) -> str:
+    """Best-effort ``PID N (exe)`` summary for doctor WARN lines."""
+
+    try:
+        from ..port_detect import describe_port_owners
+
+        owners = describe_port_owners(int(port))
+    except Exception:
+        return ""
+    if not owners:
+        return ""
+    parts: List[str] = []
+    for pid, label in owners[:3]:
+        if label and label != "unknown":
+            parts.append(f"PID {pid} {label}")
+        else:
+            parts.append(f"PID {pid}")
+    return ", ".join(parts)
 
 
 def is_port_in_use(port: int, *, host: str = "0.0.0.0") -> bool:

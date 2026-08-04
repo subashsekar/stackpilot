@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, TextIO
 
 PrintFn = Callable[[str], None]
 
@@ -20,7 +21,6 @@ def format_shutdown_summary(
     lines = [
         "",
         "Stopping StackPilot...",
-        "",
     ]
     for name in stopped_names:
         lines.append(f"✓ {name} stopped")
@@ -29,9 +29,8 @@ def format_shutdown_summary(
         [
             "",
             "Summary:",
-            "",
-            f"Services stopped: {len(stopped_names)}/{total}",
-            f"Shutdown time: {shutdown_time_s:.1f}s",
+            f"  Services stopped: {len(stopped_names)}/{total}",
+            f"  Shutdown time: {shutdown_time_s:.1f}s",
         ]
     )
     return "\n".join(lines)
@@ -50,9 +49,9 @@ def format_crash_report(
     return "\n".join(
         [
             "",
-            f"❌ {service} exited (Exit Code: {code})",
-            f"Issue recorded: {display_path}",
-            "Remaining services continue running...",
+            f"❌ {service} exited (exit {code})",
+            f"  Issue: {display_path}",
+            "  Remaining services continue running.",
         ]
     )
 
@@ -69,6 +68,82 @@ def format_ready_urls(
     for name, url in entries:
         lines.append(f"  {name.ljust(width)}  {url}")
     return "\n".join(lines)
+
+
+def format_runtime_summary(
+    *,
+    started: int,
+    total: int,
+    startup_time_s: float,
+) -> str:
+    """Compact post-startup runtime summary (counts + elapsed)."""
+
+    return f"✓ Started {started}/{total} services in {startup_time_s:.1f}s"
+
+
+def format_application_logs_banner() -> str:
+    """Separator printed once before flushing buffered startup logs."""
+
+    return "\n".join(
+        [
+            "",
+            "-" * 52,
+            "",
+            "Application Logs",
+            "",
+        ]
+    )
+
+
+def format_wave_header(wave_number: int, names: Sequence[str]) -> str:
+    """Dependency-aware startup / shutdown wave banner."""
+
+    lines = ["", f"Wave {wave_number}"]
+    lines.extend(names)
+    return "\n".join(lines)
+
+
+def color_enabled(
+    stream: Optional[TextIO] = None,
+    *,
+    force: Optional[bool] = None,
+) -> bool:
+    """
+    Decide whether ANSI / Click colors should be used.
+
+    Respects ``NO_COLOR``, ``FORCE_COLOR`` / ``CLICOLOR_FORCE``, ``CI``,
+    and TTY detection (including Windows consoles).
+    """
+
+    if force is not None:
+        return force
+    if os.environ.get("NO_COLOR", "").strip():
+        return False
+    if os.environ.get("FORCE_COLOR", "").strip() or os.environ.get(
+        "CLICOLOR_FORCE", ""
+    ).strip():
+        return True
+    if os.environ.get("CI", "").strip():
+        return False
+    target = stream if stream is not None else sys.stdout
+    isatty = getattr(target, "isatty", lambda: False)
+    try:
+        return bool(isatty())
+    except Exception:
+        return False
+
+
+def style_text(text: str, *, fg: Optional[str] = None, bold: bool = False) -> str:
+    """Apply Click color when available; otherwise return ``text`` unchanged."""
+
+    if not fg and not bold:
+        return text
+    try:
+        import click
+
+        return click.style(text, fg=fg, bold=bold)
+    except Exception:
+        return text
 
 
 def print_safe(
@@ -88,7 +163,11 @@ def print_safe(
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     fallback = ascii_fallback
     if fallback is None:
-        fallback = message.encode(encoding, errors="replace").decode(encoding)
+        fallback = ascii_fallback_dx(message)
+        try:
+            fallback.encode(encoding)
+        except UnicodeEncodeError:
+            fallback = message.encode(encoding, errors="replace").decode(encoding)
 
     text = message
     try:
@@ -110,9 +189,24 @@ def ascii_fallback_dx(text: str) -> str:
         .replace("✗", "X")
         .replace("✓", "+")
         .replace("→", "->")
+        .replace("—", "-")
+        .replace("–", "-")
         .replace("…", "...")
+        .replace("⋯", "...")
+        .replace("⚠", "!")
         .replace("·", "-")
+        .replace("•", "*")
         .replace("━", "-")
+        .replace("─", "-")
+        .replace("│", "|")
+        .replace("├", "+")
+        .replace("└", "`")
+        .replace("↓", "v")
+        .replace("🟢", "[*]")
+        .replace("🔴", "[x]")
+        .replace("🟡", "[~]")
+        .replace("⚪", "[ ]")
+        .replace("🔵", "[#]")
     )
 
 

@@ -47,9 +47,11 @@ _FILE_LINE_RE = re.compile(
     r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+)'
 )
 _EXCEPTION_LINE = re.compile(
-    r"^(?P<type>[A-Za-z_][\w.]*(?:Error|Exception|Exit|Warning|Fault|Timeout|Interrupt))"
+    # Allow bare Node ``Error:`` as well as ``ValueError:`` / ``ModuleNotFoundError:``.
+    r"^(?P<type>(?:[A-Za-z_][\w.]*)?(?:Error|Exception|Exit|Warning|Fault|Timeout|Interrupt))"
     r"(?::\s*(?P<message>.*))?$"
 )
+_NODE_AT_FRAME = re.compile(r"^\s+at\s+")
 # Framework / server frames that must never win as the "last application frame".
 _FRAMEWORK_PATH_MARKERS = (
     "/uvicorn/",
@@ -172,6 +174,10 @@ class IssueTracker:
         self._last_locations: Dict[str, str] = {}
         # Last parsed exception (type / message / app frame) per service.
         self._last_exceptions: Dict[str, ParsedException] = {}
+        # Last raw application stderr / traceback for failure UX (in-memory).
+        self._last_application_output: Dict[str, str] = {}
+        # Incomplete Node.js stack buffers (Error: … / at …).
+        self._node_stack_buffers: Dict[str, List[str]] = {}
         self._cleanup_timer: Optional[threading.Timer] = None
         self._closed = False
 
@@ -204,6 +210,13 @@ class IssueTracker:
 
         with self._lock:
             return self._last_exceptions.get(sanitize_service_name(service))
+
+    def last_application_output(self, service: str) -> Optional[str]:
+        """Return the last captured application stderr / traceback text."""
+
+        with self._lock:
+            text = self._last_application_output.get(sanitize_service_name(service))
+            return text if text else None
 
     def record_error(
         self,
@@ -257,13 +270,22 @@ class IssueTracker:
                     traceback,
                     project_root=self._project_root,
                 )
-                self._last_exceptions[sanitize_service_name(service)] = parsed
+                key = sanitize_service_name(service)
+                self._last_exceptions[key] = parsed
+                self._last_application_output[key] = traceback
             elif exception_type or file_line != "-":
-                self._last_exceptions[sanitize_service_name(service)] = ParsedException(
+                key = sanitize_service_name(service)
+                self._last_exceptions[key] = ParsedException(
                     exception_type=exception_type,
                     exception_message=error if exception_type else None,
                     file_line=None if file_line == "-" else file_line,
                 )
+                if root_cause and key not in self._last_application_output:
+                    self._last_application_output[key] = root_cause
+            elif root_cause:
+                key = sanitize_service_name(service)
+                if key not in self._last_application_output:
+                    self._last_application_output[key] = root_cause
 
             path = self.issue_path(service)
             rows = self._read_rows(path)
@@ -344,7 +366,41 @@ class IssueTracker:
 
             if _TRACEBACK_START.match(text):
                 self._traceback_buffers[service] = [text]
+                self._node_stack_buffers.pop(service, None)
                 return None
+
+            # Extend a pending Node.js stack with ``at …`` frames.
+            node_buf = self._node_stack_buffers.get(service)
+            if node_buf is not None and _NODE_AT_FRAME.match(text):
+                node_buf.append(text)
+                key = sanitize_service_name(service)
+                self._last_application_output[key] = "\n".join(node_buf)
+                if len(node_buf) > _MAX_TRACEBACK_LINES:
+                    self._node_stack_buffers.pop(service, None)
+                return None
+            if node_buf is not None and not _NODE_AT_FRAME.match(text):
+                # Stack finished; keep captured output and process this line normally.
+                self._node_stack_buffers.pop(service, None)
+
+            # Prefer exception / Error lines over log-level token matching so
+            # ``Error: Cannot find module`` starts a Node stack instead of a
+            # single-line ERROR issue.
+            exc_match = _EXCEPTION_LINE.match(text)
+            if (
+                exc_match
+                and not text.startswith((" ", "\t"))
+                and not _TRACEBACK_START.match(text)
+            ):
+                exc_type = exc_match.group("type")
+                if not _is_warning_type(exc_type):
+                    message = (exc_match.group("message") or "").strip()
+                    self._node_stack_buffers[service] = [text]
+                    return self.record_error(
+                        service,
+                        root_cause=message or exc_type,
+                        exception_type=exc_type,
+                        traceback=text,
+                    )
 
             # Skip Python warnings + indented warning source snippets. Console
             # still shows them; they are not actionable Issue Tracker rows.
@@ -363,18 +419,6 @@ class IssueTracker:
                     if _is_warning_line(message):
                         return None
                     return self.record_error(service, root_cause=message)
-
-            exc_match = _EXCEPTION_LINE.match(text)
-            if exc_match and not text.startswith((" ", "\t")):
-                exc_type = exc_match.group("type")
-                if _is_warning_type(exc_type):
-                    return None
-                message = (exc_match.group("message") or "").strip()
-                return self.record_error(
-                    service,
-                    root_cause=message or exc_type,
-                    exception_type=exc_type,
-                )
 
             # Level-less stderr: keep for bare failures (``Connection refused``),
             # but never treat routine HTTP access lines as issues.
@@ -414,9 +458,11 @@ class IssueTracker:
             if changed:
                 self._write_rows(path, rows)
             self._traceback_buffers.pop(service, None)
+            self._node_stack_buffers.pop(service, None)
             key = sanitize_service_name(service)
             self._last_locations.pop(key, None)
             self._last_exceptions.pop(key, None)
+            self._last_application_output.pop(key, None)
         return updated
 
     def cleanup(self) -> int:
@@ -832,19 +878,100 @@ def format_issues_report(
     heading: str,
     empty_message: str,
 ) -> str:
-    """Format issues for ``stackpilot issues`` CLI output."""
+    """Format issues for ``stackpilot issues`` as a diagnostics table."""
 
     if not issues:
-        return empty_message
-    lines = [heading, ""]
+        return empty_message if empty_message.endswith("\n") else empty_message + "\n"
+
+    headers = ("TIME", "SERVICE", "SEVERITY", "STATUS", "REASON", "RESOLUTION")
+    rows: List[tuple[str, ...]] = []
     for issue in issues:
-        lines.append(issue.service)
-        detail = issue.root_cause
+        reason = issue.root_cause
+        location = ""
         if issue.file_line and issue.file_line != "-":
-            detail = f"{detail} ({issue.file_line})"
-        lines.append(detail)
-        lines.append("")
+            location = f" ({issue.file_line})"
+        rows.append(
+            (
+                _short_issue_time(issue.first_seen),
+                issue.service,
+                _issue_severity(issue),
+                issue.status,
+                f"{reason}{location}",
+                _issue_resolution(issue),
+            )
+        )
+
+    lines = [heading, "-" * len(heading), "", _format_issues_table(headers, rows)]
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _short_issue_time(value: str) -> str:
+    text = (value or "").strip()
+    if "T" in text:
+        # ISO → HH:MM:SS
+        try:
+            return text.split("T", 1)[1][:8]
+        except Exception:
+            return text
+    if " " in text and len(text) >= 19:
+        return text.split(" ", 1)[1][:8]
+    return text or "-"
+
+
+def _issue_severity(issue: Issue) -> str:
+    if issue.exception_type:
+        return "error"
+    cause = (issue.root_cause or "").lower()
+    if "warn" in cause:
+        return "warning"
+    if issue.exit_code not in (None, 0):
+        return "error"
+    return "error"
+
+
+def _issue_resolution(issue: Issue) -> str:
+    cause = (issue.root_cause or "").lower()
+    if "connection refused" in cause or "not reachable" in cause:
+        return "Start dependency; check host/port"
+    if "module" in cause and "not found" in cause:
+        return "Install package or fix import path"
+    if "address already in use" in cause or "port" in cause and "in use" in cause:
+        return "Free the port or change service port"
+    if "permission" in cause:
+        return "Fix file/process permissions"
+    if issue.file_line and issue.file_line != "-":
+        return f"Inspect {issue.file_line}"
+    if issue.status == STATUS_FIXED:
+        return "Resolved"
+    return "See service logs / stackpilot doctor"
+
+
+def _format_issues_table(
+    headers: Sequence[str], rows: Sequence[Sequence[str]]
+) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    # Cap reason / resolution so wide terminals stay readable.
+    widths[4] = min(max(widths[4], 24), 64)
+    widths[5] = min(max(widths[5], 16), 40)
+
+    def _clip(text: str, width: int) -> str:
+        raw = str(text)
+        if len(raw) <= width:
+            return raw.ljust(width)
+        if width <= 3:
+            return raw[:width]
+        return raw[: width - 3] + "..."
+
+    head = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    sep = "  ".join("-" * widths[i] for i in range(len(headers)))
+    body = [
+        "  ".join(_clip(cell, widths[i]) for i, cell in enumerate(row))
+        for row in rows
+    ]
+    return "\n".join([head, sep, *body])
 
 
 def _find_fingerprint(
@@ -907,12 +1034,20 @@ def _is_non_actionable_stderr(text: str) -> bool:
     - Python ``UserWarning`` / ``DeprecationWarning`` / … headers
     - Indented warning source snippets (``  validated_self = …``)
     - Explicit non-error log levels already filtered elsewhere
+    - Flask / Werkzeug informational startup banners
     """
 
     if text.startswith((" ", "\t")):
         return True
     if _is_warning_line(text):
         return True
+    try:
+        from .logger import is_framework_info_line
+
+        if is_framework_info_line(text):
+            return True
+    except Exception:
+        pass
     return False
 
 

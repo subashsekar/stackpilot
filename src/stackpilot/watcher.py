@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -272,8 +273,15 @@ class ServiceWatcher:
             return
         if self._owns_observer:
             self._observer.stop()
+            try:
+                self._observer.unschedule_all()
+            except Exception:
+                pass
             self._observer.join(timeout=5.0)
         self._started = False
+        # Drop the change callback so a late debounce fire cannot restart work.
+        self._on_change = None
+        self._handler._on_change = lambda *_args, **_kwargs: None
 
     def notify_for_tests(self, path: Path, *, event_type: str = "modified") -> None:
         """Synthesize a filesystem event (used by unit tests)."""
@@ -302,7 +310,18 @@ class _DebouncedHandler(FileSystemEventHandler):
         self._pending = False
         self._pending_paths: Set[str] = set()
         self._signatures: Dict[str, FileSignature] = {}
+        # Windows: paths waiting on a deferred mtime/size recheck after an
+        # early "modified" notification arrived before the writer flushed.
+        self._recheck_scheduled: Set[str] = set()
+        self._recheck_timers: List[threading.Timer] = []
+        # Attempt index per path for staggered Windows rechecks.
+        self._recheck_attempts: Dict[str, int] = {}
         self.fire_count = 0
+
+    # Staggered delays (seconds) for Windows early-notify rechecks. A single
+    # short sleep is not enough for some editors / AV flushes; giving up too
+    # early silently drops real reloads.
+    _WIN_RECHECK_DELAYS_S: Tuple[float, ...] = (0.08, 0.22, 0.45)
 
     def on_created(self, event: FileSystemEvent) -> None:
         self._consider(event.src_path, event_type="created", is_directory=event.is_directory)
@@ -332,26 +351,73 @@ class _DebouncedHandler(FileSystemEventHandler):
         """Capture a baseline of existing files so open/focus noise won't reload."""
 
         try:
-            iterator = root.rglob("*")
+            walk_root = str(root)
         except OSError:
             return
 
-        for path in iterator:
-            if not path.is_file() or self._should_ignore(path):
-                continue
-            sig = self._signature(path)
-            if sig is not None:
-                self._signatures[str(path.resolve())] = sig
+        # Prune ignored directories while walking so large trees (node_modules,
+        # .git, .venv) never get scanned. rglob alone still visits every file.
+        for dirpath, dirnames, filenames in os.walk(walk_root, topdown=True):
+            keep: List[str] = []
+            for name in dirnames:
+                child = Path(dirpath) / name
+                if self._should_ignore(child):
+                    continue
+                # Fast path for well-known junk even without an IgnoreMatcher.
+                if name.lower() in {
+                    ".git",
+                    "__pycache__",
+                    ".pytest_cache",
+                    ".mypy_cache",
+                    "node_modules",
+                    ".venv",
+                    "venv",
+                    ".logs",
+                    ".stackpilot",
+                    "dist",
+                    "build",
+                }:
+                    continue
+                keep.append(name)
+            dirnames[:] = keep
+
+            for name in filenames:
+                path = Path(dirpath) / name
+                if self._should_ignore(path):
+                    continue
+                if not path.is_file():
+                    continue
+                sig = self._signature(path)
+                if sig is not None:
+                    try:
+                        key = str(path.resolve())
+                    except OSError:
+                        key = str(path)
+                    self._signatures[key] = sig
 
     def cancel(self) -> None:
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            for timer in self._recheck_timers:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            self._recheck_timers.clear()
+            self._recheck_scheduled.clear()
+            self._recheck_attempts.clear()
             self._pending = False
             self._pending_paths.clear()
 
-    def _consider(self, raw_path: str, *, event_type: str, is_directory: bool) -> None:
+    def _consider(
+        self,
+        raw_path: str,
+        *,
+        event_type: str,
+        is_directory: bool,
+    ) -> None:
         if event_type in {"opened", "closed", "closed_no_write"}:
             return
         if is_directory:
@@ -363,8 +429,60 @@ class _DebouncedHandler(FileSystemEventHandler):
         if self._should_ignore(path):
             return
         if not self._is_real_change(path, event_type=event_type):
+            # Windows ReadDirectoryChangesW often notifies before the writer
+            # flushes the new mtime/size. A single 20ms re-stat drops real
+            # edits; defer staggered rechecks instead of discarding the event.
+            if (
+                sys.platform == "win32"
+                and event_type == "modified"
+                and not is_directory
+            ):
+                self._schedule_recheck(path)
             return
+        # Real change observed — cancel any pending recheck bookkeeping.
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        with self._lock:
+            self._recheck_attempts.pop(key, None)
         self._schedule(str(path))
+
+    def _schedule_recheck(self, path: Path) -> None:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        with self._lock:
+            if key in self._recheck_scheduled:
+                return
+            attempt = int(self._recheck_attempts.get(key, 0))
+            if attempt >= len(self._WIN_RECHECK_DELAYS_S):
+                self._recheck_attempts.pop(key, None)
+                return
+            delay = self._WIN_RECHECK_DELAYS_S[attempt]
+            self._recheck_attempts[key] = attempt + 1
+            self._recheck_scheduled.add(key)
+
+            def _recheck() -> None:
+                with self._lock:
+                    self._recheck_scheduled.discard(key)
+                    try:
+                        self._recheck_timers.remove(timer)
+                    except ValueError:
+                        pass
+                # Re-enter consider; if signature still matches, another
+                # staggered attempt is scheduled until delays are exhausted.
+                self._consider(
+                    str(path),
+                    event_type="modified",
+                    is_directory=False,
+                )
+
+            timer = threading.Timer(delay, _recheck)
+            timer.daemon = True
+            self._recheck_timers.append(timer)
+            timer.start()
 
     def _is_real_change(self, path: Path, *, event_type: str) -> bool:
         key = str(path.resolve())
@@ -374,19 +492,33 @@ class _DebouncedHandler(FileSystemEventHandler):
             return existed
 
         sig = self._signature(path)
+        if event_type == "moved":
+            # Rename source may already be gone (atomic replace / save-as).
+            if sig is None:
+                existed = key in self._signatures
+                self._forget_tree(path)
+                return existed
+            self._signatures[key] = sig
+            # Dest of an atomic replace / rename always counts — even when
+            # content length matches the previous file (editor rewrite).
+            return True
+
         if sig is None:
             return False
 
         old = self._signatures.get(key)
         self._signatures[key] = sig
-        if event_type in {"created", "moved"}:
-            return old != sig
+        if event_type == "created":
+            # Genuinely new path, or recreate after delete. An identical
+            # signature to the primed baseline is open/focus noise.
+            return old is None or old != sig
         if event_type == "modified":
             if old != sig:
                 return True
             if sys.platform == "win32" and old is not None:
-                # Some Windows writers notify before the new mtime is visible.
-                # Re-stat once; ignore pure no-op / focus noise when unchanged.
+                # Brief re-stat for writers that flush within a few ms.
+                # Unchanged results fall through to a deferred recheck in
+                # ``_consider`` so late flushes still trigger reload.
                 time.sleep(0.02)
                 sig2 = self._signature(path)
                 if sig2 is None:
@@ -400,21 +532,41 @@ class _DebouncedHandler(FileSystemEventHandler):
         """Drop signatures for ``path`` and every recorded descendant."""
 
         try:
-            target = path.resolve()
+            target = str(path.resolve())
         except OSError:
-            target = Path(path)
+            target = str(path)
 
-        for key in list(self._signatures):
-            try:
-                key_path = Path(key).resolve()
-            except OSError:
-                key_path = Path(key)
-            try:
-                if key_path == target or target in key_path.parents:
-                    self._signatures.pop(key, None)
-            except (ValueError, OSError):
-                if key == str(target):
-                    self._signatures.pop(key, None)
+        # Prefix match avoids resolving every signature key on large trees.
+        # Compare case-insensitively on Windows where path casing can drift.
+        if sys.platform == "win32":
+            target_key = target.casefold()
+            prefix = target_key if target_key.endswith("\\") else target_key + "\\"
+            # Also accept forward-slash variants from mixed path styles.
+            prefix_alt = prefix.replace("\\", "/")
+            target_alt = target_key.replace("\\", "/")
+            drop: List[str] = []
+            for key in self._signatures:
+                folded = key.casefold()
+                folded_slash = folded.replace("\\", "/")
+                if (
+                    folded == target_key
+                    or folded_slash == target_alt
+                    or folded.startswith(prefix)
+                    or folded_slash.startswith(prefix_alt)
+                ):
+                    drop.append(key)
+            for key in drop:
+                self._signatures.pop(key, None)
+            return
+
+        prefix = target if target.endswith(os.sep) else target + os.sep
+        drop = [
+            key
+            for key in self._signatures
+            if key == target or key.startswith(prefix)
+        ]
+        for key in drop:
+            self._signatures.pop(key, None)
 
     def _signature(self, path: Path) -> Optional[FileSignature]:
         try:
@@ -428,12 +580,32 @@ class _DebouncedHandler(FileSystemEventHandler):
         if path.name == ".stackpilotignore":
             return True
 
+        # Editor / OS transient save artifacts (VS Code, Cursor, PyCharm,
+        # vim, emacs). Ignoring them prevents duplicate reload storms during
+        # atomic replace (write-temp → rename) and rapid multi-save.
+        name = path.name
+        lower_name = name.lower()
+        if (
+            lower_name.endswith(".tmp")
+            or lower_name.endswith(".temp")
+            or lower_name.endswith(".swp")
+            or lower_name.endswith(".swo")
+            or lower_name.endswith("~")
+            or name.startswith(".#")
+            or name.endswith("---jb_tmp___")
+            or name.endswith("---jb_old___")
+            or "___jb_tmp___" in name
+            or "___jb_old___" in name
+            or lower_name.endswith(".partial")
+        ):
+            return True
+
         if self._ignore is not None:
             return self._ignore.ignored(path)
 
         # Fallback: skip common junk when no matcher was provided.
         parts = {p.lower() for p in path.parts}
-        for name in (
+        for junk in (
             ".git",
             "__pycache__",
             ".pytest_cache",
@@ -445,7 +617,7 @@ class _DebouncedHandler(FileSystemEventHandler):
             "dist",
             "build",
         ):
-            if name in parts:
+            if junk in parts:
                 return True
         if path.suffix.lower() in {".pyc", ".pyo", ".log"}:
             return True
@@ -473,6 +645,16 @@ class _DebouncedHandler(FileSystemEventHandler):
             self.fire_count += 1
         try:
             self._on_change(self._service_name, paths)
-        except Exception:
-            # Never let callback failures kill the observer thread.
-            pass
+        except Exception as exc:
+            # Never let callback failures kill the observer thread, but do not
+            # swallow them silently — that looks like "reload never happens".
+            try:
+                from .dashboard import ascii_fallback_dx, print_safe
+
+                msg = (
+                    f"stackpilot: reload callback failed for "
+                    f"{self._service_name!r}: {exc}"
+                )
+                print_safe(msg, ascii_fallback=ascii_fallback_dx(msg))
+            except Exception:
+                pass

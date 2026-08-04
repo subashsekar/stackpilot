@@ -126,8 +126,7 @@ def classify_spawn_error(
             return (
                 "Port already in use",
                 "Another process is already bound to the service port.",
-                "Free the port or change port= / the health URL, then re-run. "
-                "Run: stackpilot doctor",
+                "stackpilot stop\nor\nchange the service port",
             )
         if "winerror 267" in message or "not a directory" in message:
             return (
@@ -170,6 +169,95 @@ def classify_spawn_error(
     )
 
 
+def format_port_already_in_use(
+    *,
+    port: int,
+    service: Optional[str] = None,
+    owners: Optional[Sequence[tuple[int, str]]] = None,
+) -> str:
+    """
+    Friendly block when a foreign process already owns the service port.
+
+    When ``owners`` is omitted, looks up listening PIDs and executable names
+    best-effort (never raises).
+    """
+
+    port_i = int(port)
+    if owners is None:
+        try:
+            from ..port_detect import describe_port_owners
+
+            owners = describe_port_owners(port_i)
+        except Exception:
+            owners = ()
+
+    if service:
+        reason = f'Service "{service}" requires {port_i}.'
+    else:
+        reason = f"Port {port_i} is required but already occupied."
+
+    lines = [
+        "Problem: Port already in use",
+    ]
+    if service:
+        lines.append(f"Affected service: {service}")
+    lines.append(f"Reason: {reason}")
+    lines.append("Current owner:")
+    if owners:
+        for pid, label in owners:
+            lines.append(f"PID {int(pid)}")
+            if label and label != "unknown":
+                lines.append(str(label))
+            else:
+                lines.append("(executable unknown)")
+    else:
+        lines.append("(could not determine owning process)")
+    lines.append(
+        "Suggested fix: stackpilot stop\n"
+        "\n"
+        "or\n"
+        "\n"
+        "change the service port"
+    )
+    return "\n".join(lines)
+
+
+def format_circular_dependency_error(cycle: Sequence[str]) -> str:
+    """Friendly block for a circular service dependency (run / CLI path)."""
+
+    if not cycle:
+        reason = "A circular dependency was found in the service graph."
+    else:
+        lines: list[str] = [""]
+        for index, name in enumerate(cycle):
+            lines.append(str(name))
+            if index < len(cycle) - 1:
+                lines.append(" ↓")
+        reason = "\n".join(lines)
+    return format_user_error(
+        problem="Circular dependency detected",
+        reason=reason,
+        suggested_fix="Remove one dependency to break the cycle.",
+    )
+
+
+def format_cleanup_failure(*, remaining_pids: Sequence[int]) -> str:
+    """User-facing Problem / Reason / Suggested fix when stop leaves orphans."""
+
+    if remaining_pids:
+        pid_lines = "\n".join(str(int(pid)) for pid in remaining_pids)
+        reason = f"The following PIDs remain alive:\n{pid_lines}"
+    else:
+        reason = "One or more service listening ports were not released."
+    return format_user_error(
+        problem="Unable to terminate all services.",
+        reason=reason,
+        suggested_fix=(
+            "Run stackpilot stop --force\nor terminate the listed processes manually."
+        ),
+    )
+
+
 def format_health_timeout(
     *,
     service: str,
@@ -204,6 +292,77 @@ def format_health_timeout(
     )
 
 
+def format_health_http_failure(
+    *,
+    service: str,
+    health_url: str,
+    kind: str,
+    detail: str = "",
+    configured_path: str = "",
+    discovered_routes: Sequence[str] = (),
+) -> str:
+    """
+    Problem / Reason / Suggested fix for a single HTTP health probe outcome.
+
+    Covers 404 (not_found), 5xx (failed), timeout, and connection refused.
+    Never includes a traceback.
+    """
+
+    url = (health_url or "").strip() or "(unknown)"
+    path = (configured_path or "").strip()
+    probe_detail = (detail or "").strip()
+
+    if kind == "not_found":
+        problem = "Health endpoint not found"
+        reason = f"HTTP 404 for {url}."
+        if path:
+            reason = f"{reason} Configured path: {path}."
+        if discovered_routes:
+            routes = ", ".join(str(r) for r in discovered_routes[:8])
+            fix = (
+                f"Update health_check= to a real path (detected: {routes}). "
+                "Or run: stackpilot doctor"
+            )
+        else:
+            fix = (
+                "Confirm the health path exists and matches health_check= "
+                "in Stackfile.py. Run: stackpilot doctor"
+            )
+    elif kind == "failed":
+        problem = "Health check failed"
+        status = probe_detail or "HTTP 5xx"
+        reason = f"{status} from {url}."
+        fix = (
+            "Inspect application logs for the server error, fix the failure, "
+            "then re-run. Run: stackpilot issues"
+        )
+    elif kind == "timeout":
+        problem = "Health check timed out"
+        reason = f"No timely response from {url}."
+        fix = (
+            "Confirm the process is listening and not blocked. "
+            "Increase health timeout or fix the application. Run: stackpilot doctor"
+        )
+    elif kind == "refused":
+        problem = "Connection refused"
+        reason = f"Nothing accepted connections for {url}."
+        fix = (
+            "Confirm the process started and the port matches health_check=. "
+            "Run: stackpilot doctor / stackpilot issues"
+        )
+    else:
+        problem = "Health check failed"
+        reason = probe_detail or f"Probe of {url} did not succeed."
+        fix = "Inspect service logs, then run: stackpilot doctor"
+
+    return format_user_error(
+        problem=problem,
+        reason=reason,
+        suggested_fix=fix,
+        service=service,
+    )
+
+
 def format_external_timeout(
     *,
     label: str,
@@ -224,6 +383,34 @@ def format_external_timeout(
             "Verify with `stackpilot doctor`."
         ),
     )
+
+
+def format_corrupted_runtime(*, cleared: bool = True) -> str:
+    """Friendly block when ``.stackpilot/runtime.json`` cannot be parsed."""
+
+    reason = (
+        "``.stackpilot/runtime.json`` exists but is not valid JSON / schema."
+    )
+    fix = (
+        "Runtime status was cleared. Re-run `stackpilot run` (or "
+        "`stackpilot stop --force` if processes are still live)."
+        if cleared
+        else "Delete `.stackpilot/runtime.json` or run `stackpilot stop --force`, "
+        "then re-run."
+    )
+    return format_user_error(
+        problem="Corrupted runtime status",
+        reason=reason,
+        suggested_fix=fix,
+    )
+
+
+def format_missing_stackfile() -> str:
+    """Friendly block when no Stackfile.py can be discovered."""
+
+    from ..discovery import MISSING_STACKFILE_MESSAGE
+
+    return MISSING_STACKFILE_MESSAGE
 
 
 def _first_token(command: str) -> str:

@@ -95,8 +95,8 @@ def test_monitor_stays_alive_after_one_crash(
     while time.monotonic() < deadline:
         joined = "\n".join(printed)
         if (
-            "auth exited (Exit Code: 1)" in joined
-            and "Remaining services continue running..." in joined
+            "auth exited (exit 1)" in joined
+            and "Remaining services continue running." in joined
             and issue_path.is_file()
         ):
             break
@@ -113,7 +113,7 @@ def test_monitor_stays_alive_after_one_crash(
     text = issue_path.read_text(encoding="utf-8")
     assert "ACTIVE" in text
     assert "database.py:42" in text
-    assert "Issue recorded:" in "\n".join(printed)
+    assert "Issue:" in "\n".join(printed)
     assert any("auth.issue" in line for line in printed)
 
     # Surviving service continues streaming logs after the crash banner.

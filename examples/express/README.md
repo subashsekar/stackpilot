@@ -26,7 +26,7 @@ cd examples/express
 stackpilot run
 ```
 
-Health: `http://127.0.0.1:8000/`
+Health: `http://127.0.0.1:8004/`
 
 ## Re-sync
 

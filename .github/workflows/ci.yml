@@ -141,7 +141,10 @@ jobs:
           assert "stackpilot logs" not in text or "Where did" in text
           assert ".stackpilot/logs/" not in text or "not `.stackpilot/logs/`" in text
           # Public commands still documented
-          for cmd in ("init", "sync", "run", "graph", "status", "ps", "issues", "doctor", "version"):
+          for cmd in (
+              "init", "sync", "run", "stop", "graph", "status", "ps",
+              "issues", "doctor", "version",
+          ):
               assert f"stackpilot {cmd}" in text or f"`{cmd}`" in text, cmd
           print("README structure ok")
           PY

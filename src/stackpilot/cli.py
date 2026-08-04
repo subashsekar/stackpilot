@@ -40,6 +40,7 @@ from .port_detect import resolve_service_port
 from .status import (
     derive_health,
     detect_framework,
+    detect_language,
     format_ps_table,
     format_status_report,
     load_runtime_snapshot,
@@ -245,11 +246,15 @@ def run(
 def stop() -> None:
     """Stop every service started by StackPilot."""
 
-    project = _require_project()
-    from .runtime_control import stop_runtime_session
+    from .runtime_control import resolve_session_root, stop_runtime_session
+
+    root = resolve_session_root(Path.cwd())
+    if root is None:
+        safe_echo("No running StackPilot session.")
+        raise typer.Exit(code=0)
 
     try:
-        result = stop_runtime_session(project.root)
+        result = stop_runtime_session(root)
     except Exception as e:
         typer.secho(
             f"Failed to stop StackPilot session: {e}",
@@ -276,8 +281,24 @@ def graph() -> None:
     )
     try:
         dep_graph = build_graph(stack)
+    except DependencyError as e:
+        _fail_dependency(e)
+
+    try:
         dep_graph.validate()
     except CircularDependencyError as e:
+        snapshot = load_runtime_snapshot(project.root)
+        statuses, ports, frameworks, languages = _graph_display_maps(stack, snapshot)
+        report = format_architecture_report(
+            dep_graph,
+            statuses=statuses,
+            ports=ports,
+            frameworks=frameworks,
+            languages=languages,
+            unicode=True,
+            cycle=e.cycle,
+        )
+        _print_architecture_report(report)
         safe_echo(
             format_circular_dependency(e.cycle),
             err=True,
@@ -289,22 +310,16 @@ def graph() -> None:
         _fail_dependency(e)
 
     snapshot = load_runtime_snapshot(project.root)
-    statuses, ports, frameworks = _graph_display_maps(stack, snapshot)
+    statuses, ports, frameworks, languages = _graph_display_maps(stack, snapshot)
     report = format_architecture_report(
         dep_graph,
         statuses=statuses,
         ports=ports,
         frameworks=frameworks,
+        languages=languages,
         unicode=True,
     )
-    ascii_report = format_architecture_report(
-        dep_graph,
-        statuses=statuses,
-        ports=ports,
-        frameworks=frameworks,
-        unicode=False,
-    )
-    _print_architecture_report(report, ascii_fallback=ascii_report)
+    _print_architecture_report(report)
 
 
 @app.command()
@@ -322,8 +337,9 @@ def status() -> None:
         services=rows,
         session_active=session_active,
         external_dependencies=externals,
+        color=None,
     )
-    typer.echo(text, nl=False)
+    safe_echo(text, ascii_fallback=text, nl=False)
 
 
 @app.command("ps")
@@ -334,7 +350,7 @@ def ps_cmd() -> None:
     stack = _load_stack(project.stackfile)
     snapshot = load_runtime_snapshot(project.root)
     rows = _merge_status_rows(stack.services, snapshot)
-    typer.echo(format_ps_table(rows), nl=False)
+    safe_echo(format_ps_table(rows, color=None), nl=False)
 
 
 @app.command()
@@ -434,8 +450,23 @@ def _merge_status_rows(specs, snapshot: Optional[Dict[str, Any]]) -> List[Dict[s
     rows: List[Dict[str, Any]] = []
     for spec in specs:
         runtime = by_name.pop(spec.name, None)
+        cmd = str(spec.command or "")
+        fw = detect_framework(cmd, path=spec.path)
+        lang = detect_language(cmd, framework=fw)
         if runtime is not None:
-            runtime.setdefault("framework", detect_framework(spec.command))
+            stored_fw = str(runtime.get("framework") or "").strip()
+            # Never keep a stale "-" for Node (or any) service when command
+            # detection can resolve a real framework label.
+            if not stored_fw or stored_fw == "-":
+                runtime["framework"] = fw
+            else:
+                runtime.setdefault("framework", fw)
+            runtime.setdefault("language", lang)
+            if not runtime.get("language") or runtime.get("language") == "-":
+                runtime["language"] = detect_language(
+                    cmd, framework=str(runtime.get("framework") or fw)
+                )
+            runtime.setdefault("command", cmd)
             pid = runtime.get("pid")
             use_pid = (
                 pid
@@ -443,9 +474,13 @@ def _merge_status_rows(specs, snapshot: Optional[Dict[str, Any]]) -> List[Dict[s
                 and runtime.get("status") == ServiceState.RUNNING.value
                 else None
             )
-            resolved = resolve_service_port(spec, pid=use_pid)
-            if resolved is not None:
-                runtime["port"] = resolved
+            # Prefer the port already resolved by load_runtime_snapshot (or the
+            # stored snapshot value). Re-probing every PID via netstat/lsof on
+            # each status/ps call is the dominant cost for large stacks.
+            if runtime.get("port") is None:
+                resolved = resolve_service_port(spec, pid=use_pid)
+                if resolved is not None:
+                    runtime["port"] = resolved
             runtime["health"] = derive_health(
                 str(runtime.get("status") or ServiceState.STOPPED.value)
             )
@@ -458,25 +493,43 @@ def _merge_status_rows(specs, snapshot: Optional[Dict[str, Any]]) -> List[Dict[s
                 "port": resolve_service_port(spec, pid=None),
                 "status": ServiceState.STOPPED.value,
                 "uptime": None,
-                "framework": detect_framework(spec.command),
-                "command": str(spec.command or ""),
+                "framework": fw,
+                "language": lang,
+                "command": cmd,
                 "exit_code": None,
                 "started_at": None,
                 "health": derive_health(ServiceState.STOPPED),
             }
         )
     # Preserve any leftover runtime-only entries.
-    rows.extend(by_name.values())
+    for leftover in by_name.values():
+        leftover.setdefault(
+            "framework",
+            detect_framework(str(leftover.get("command") or "")),
+        )
+        leftover.setdefault(
+            "language",
+            detect_language(
+                str(leftover.get("command") or ""),
+                framework=str(leftover.get("framework") or ""),
+            ),
+        )
+        leftover.setdefault(
+            "health",
+            derive_health(str(leftover.get("status") or ServiceState.STOPPED.value)),
+        )
+        rows.append(leftover)
     return rows
 
 
 def _graph_display_maps(stack, snapshot: Optional[Dict[str, Any]]):
-    """Build status / port / framework maps for architecture rendering."""
+    """Build status / port / framework / language maps for architecture rendering."""
 
     rows = _merge_status_rows(stack.services, snapshot)
     statuses: Dict[str, str] = {}
     ports: Dict[str, Any] = {}
     frameworks: Dict[str, str] = {}
+    languages: Dict[str, str] = {}
 
     for row in rows:
         name = str(row.get("name") or "")
@@ -488,8 +541,11 @@ def _graph_display_maps(stack, snapshot: Optional[Dict[str, Any]]):
         fw = _pretty_framework(str(row.get("framework") or ""))
         if fw:
             frameworks[name] = fw
+        lang = str(row.get("language") or "").strip()
+        if lang and lang != "-":
+            languages[name] = lang
 
-    return statuses, ports, frameworks
+    return statuses, ports, frameworks, languages
 
 
 def _pretty_framework(value: str) -> str:
@@ -502,6 +558,7 @@ def _pretty_framework(value: str) -> str:
         "django": "Django",
         "express": "Express",
         "nestjs": "NestJS",
+        "node": "Node",
         "celery": "Celery",
         "python": "",
         "-": "",
@@ -513,8 +570,34 @@ def _pretty_framework(value: str) -> str:
     return value[:1].upper() + value[1:]
 
 
-def _print_architecture_report(report: str, *, ascii_fallback: str) -> None:
-    """Print the architecture report with Rich colors when available."""
+def _print_architecture_report(
+    report: str,
+    *,
+    ascii_fallback: Optional[str] = None,
+) -> None:
+    """Print the architecture report with Rich colors when available.
+
+    Never raises — Windows cp1252 / Rich emoji failures degrade to ASCII.
+    Lazy-builds an ASCII fallback only when the console cannot encode Unicode.
+    """
+
+    import sys
+
+    from .dashboard import ascii_fallback_dx
+
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    fallback = ascii_fallback
+    try:
+        report.encode(encoding)
+        needs_ascii = False
+    except UnicodeEncodeError:
+        needs_ascii = True
+
+    if needs_ascii:
+        if fallback is None:
+            fallback = ascii_fallback_dx(report)
+        safe_echo(report, ascii_fallback=fallback)
+        return
 
     try:
         from rich.console import Console
@@ -524,28 +607,28 @@ def _print_architecture_report(report: str, *, ascii_fallback: str) -> None:
         Console(emoji=True, highlight=False, soft_wrap=False).print(
             style_architecture_text(report)
         )
-    except (ImportError, UnicodeEncodeError, OSError):
-        safe_echo(report, ascii_fallback=ascii_fallback)
+    except Exception:
+        # Broad catch: Rich/legacy Windows consoles can raise beyond
+        # UnicodeEncodeError (e.g. OSError, AttributeError from broken streams).
+        if fallback is None:
+            fallback = ascii_fallback_dx(report)
+        try:
+            safe_echo(report, ascii_fallback=fallback)
+        except Exception:
+            try:
+                print(fallback)
+            except Exception:
+                print(
+                    fallback.encode("ascii", errors="replace").decode("ascii")
+                )
 
 
 def _external_status_rows(deps) -> List[Dict[str, Any]]:
-    """Build status rows for external dependencies (live TCP probe)."""
+    """Build status rows for external dependencies (parallel short probes)."""
 
-    from .external_validation import check_external_dependency
+    from .status import probe_external_dependencies_status
 
-    rows: List[Dict[str, Any]] = []
-    for dep in deps:
-        reachable = check_external_dependency(dep)
-        rows.append(
-            {
-                "name": dep.name,
-                "type": dep.type,
-                "host": dep.host,
-                "port": dep.port,
-                "status": "reachable" if reachable else "unreachable",
-            }
-        )
-    return rows
+    return probe_external_dependencies_status(deps)
 
 
 def _require_project():
@@ -576,11 +659,14 @@ def _load_project_stack():
 
 def _fail_dependency(error: DependencyError) -> None:
     if isinstance(error, CircularDependencyError):
+        from .diagnostics.errors import format_circular_dependency_error
+
+        message = format_circular_dependency_error(error.cycle)
         safe_echo(
-            format_circular_dependency(error.cycle),
+            message,
             err=True,
             fg="red",
-            ascii_fallback=format_circular_dependency_ascii(error.cycle),
+            ascii_fallback=message.replace("↓", "v").replace("❌", "X"),
         )
         raise typer.Exit(code=1)
     safe_echo(

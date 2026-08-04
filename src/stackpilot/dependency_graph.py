@@ -333,16 +333,26 @@ class DependencyGraph:
         """
         Render the architecture dependency tree.
 
-        Uses root detection, Unicode connectors, status glyphs, ports, and
-        framework labels. Prefer :func:`stackpilot.graph_view.format_architecture_report`
-        for the full header / footer view used by ``stackpilot graph``.
+        Application services form the tree; external infrastructure is listed
+        once underneath. Prefer
+        :func:`stackpilot.graph_view.format_architecture_report` for the full
+        header / Connections / footer view used by ``stackpilot graph``.
         """
 
         self.validate()
 
-        from .graph_view import format_dependency_tree
+        from .graph_view import (
+            collect_node_displays,
+            format_dependency_tree,
+            format_external_infrastructure,
+        )
 
-        return format_dependency_tree(self)
+        nodes = collect_node_displays(self)
+        parts = [format_dependency_tree(self, nodes=nodes)]
+        externals = format_external_infrastructure(self, nodes=nodes)
+        if externals:
+            parts.extend(["", externals])
+        return "\n".join(parts)
 
 
 def _reconstruct_cycle(

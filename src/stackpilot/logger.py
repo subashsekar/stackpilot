@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import re
-import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 from .issues import DEFAULT_ISSUES_DIR, IssueTracker
-from .dashboard import ascii_fallback_dx, print_safe
+from .dashboard import ascii_fallback_dx, color_enabled, print_safe, style_text
 
 PrintFn = Callable[[str], None]
 ClockFn = Callable[[], datetime]
@@ -18,6 +17,10 @@ DEFAULT_LOGS_DIR = DEFAULT_ISSUES_DIR
 
 # Spaces after the longest ``[name]`` so columns line up.
 _STDOUT_GAP = 2
+
+# Beyond this many registered services, suppress repeated timestamps when the
+# same service emits consecutive lines in the same second (large-stack DX).
+_COMPACT_SERVICE_THRESHOLD = 30
 
 # Detect common log-level tokens at the start of a line (optionally wrapped).
 _LEVEL_RE = re.compile(
@@ -40,6 +43,26 @@ _JSON_LEVEL_RE = re.compile(
 )
 
 _WARN_HINT_RE = re.compile(r"\bUserWarning\b|\bDeprecationWarning\b|\bWarning\b")
+
+# Framework banner lines that frameworks write to stderr without a level token.
+# Treated as INFO so they do not look like failures or create Issue Tracker rows.
+_FRAMEWORK_INFO_RE = re.compile(
+    r"(?:"
+    r"^\s*\*\s+Serving Flask app\b"
+    r"|^\s*\*\s+Running on\b"
+    r"|^\s*\*\s+Debug mode\b"
+    r"|^\s*\*\s+Restarting with\b"
+    r"|^\s*\*\s+Debugger is active\b"
+    r"|^\s*\*\s+Debugger PIN\b"
+    r"|\bThis is a development server\.?\b"
+    r"|\bDo not use it in a production deployment\b"
+    r"|\bPress CTRL\+C to quit\b"
+    r"|^\s*WARNING:\s+This is a development server"
+    r"|^\s*Serving on\b"
+    r"|^\s*Booting worker with pid\b"
+    r")",
+    re.IGNORECASE,
+)
 
 _LEVEL_COLORS = {
     "DEBUG": "bright_black",
@@ -89,7 +112,9 @@ class Logger:
         self._buffering = False
         self._buffer: list[str] = []
         self._name_width = 0
-        self._color = _resolve_color(color)
+        self._color = color_enabled(force=color)
+        self._service_count = 0
+        self._last_console_key: Optional[Tuple[str, str]] = None
         if issue_tracker is not None:
             self._tracker = issue_tracker
         else:
@@ -120,6 +145,7 @@ class Logger:
         """Set names used to align ``[service]`` prefixes on stdout."""
 
         self._name_width = max((len(n) for n in names), default=0)
+        self._service_count = len(tuple(names))
 
     def set_console_enabled(self, enabled: bool) -> None:
         """Toggle terminal output (keeps shutdown messages readable)."""
@@ -216,9 +242,19 @@ class Logger:
         level_token = level.upper()
         if self._color:
             level_token = _colorize_level(level_token)
-            service_token = _style(f"[{service}]", fg="bright_blue")
+            service_token = style_text(f"[{service}]", fg="bright_blue")
         else:
             service_token = f"[{service}]"
+
+        # Large stacks: drop the repeated clock when the same service emits
+        # another line in the same second — prefixes stay aligned, less noise.
+        compact = self._service_count >= _COMPACT_SERVICE_THRESHOLD
+        key = (ts, service)
+        if compact and self._last_console_key == key:
+            blank = " " * len(ts)
+            self._last_console_key = key
+            return f"{blank} {service_token}{' ' * pad}{level_token} {message}"
+        self._last_console_key = key
         return f"{ts} {service_token}{' ' * pad}{level_token} {message}"
 
     def close(self) -> None:
@@ -232,9 +268,24 @@ def detect_log_level(line: str, *, default: str = "INFO") -> Tuple[str, str]:
     Returns ``(LEVEL, message)`` where message has the level prefix stripped
     when the level was a leading token. Embedded levels (Python logging / JSON)
     keep the full line as the message.
+
+    Flask / Werkzeug informational banners are forced to INFO so phrases like
+    ``Debug mode`` are never mistaken for a DEBUG level token.
     """
 
     text = line.rstrip("\r\n")
+
+    if is_framework_info_line(text):
+        match = _LEVEL_RE.match(text)
+        if match:
+            level = match.group("level").upper()
+            if level == "WARNING":
+                level = "WARN"
+            if level in {"ERROR", "CRITICAL", "FATAL", "WARN"}:
+                message = text[match.end() :].lstrip()
+                return level, message if message else text
+        return "INFO", text
+
     match = _LEVEL_RE.match(text)
     if match:
         level = match.group("level").upper()
@@ -260,25 +311,20 @@ def detect_log_level(line: str, *, default: str = "INFO") -> Tuple[str, str]:
     if default.upper() == "ERROR" and _WARN_HINT_RE.search(text):
         return "WARN", text
 
+    if default.upper() == "ERROR" and is_framework_info_line(text):
+        return "INFO", text
+
     return default.upper(), text
+
+
+def is_framework_info_line(line: str) -> bool:
+    """True for informational Flask / Werkzeug / similar startup banners."""
+
+    text = line.rstrip("\r\n")
+    if not text.strip():
+        return False
+    return bool(_FRAMEWORK_INFO_RE.search(text))
 
 def _colorize_level(level: str) -> str:
     fg = _LEVEL_COLORS.get(level)
-    return _style(level, fg=fg) if fg else level
-
-
-def _style(text: str, *, fg: Optional[str] = None) -> str:
-    try:
-        import click
-
-        return click.style(text, fg=fg) if fg else text
-    except Exception:
-        return text
-
-
-def _resolve_color(color: bool | None) -> bool:
-    if color is not None:
-        return color
-    stream = sys.stdout
-    isatty = getattr(stream, "isatty", lambda: False)
-    return bool(isatty())
+    return style_text(level, fg=fg) if fg else level

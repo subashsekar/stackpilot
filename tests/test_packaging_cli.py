@@ -115,8 +115,8 @@ class TestCliExecution:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0
-        assert "Stackfile.py exists" in result.output
-        assert "Services discovered" in result.output
+        assert "Stackfile" in result.output
+        assert "checks passed" in result.output or "Services discovered" in result.output
         assert "Everything looks good." in result.output
         assert "stackpilot run" in result.output
 

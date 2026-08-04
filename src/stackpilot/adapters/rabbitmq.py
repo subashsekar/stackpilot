@@ -55,6 +55,11 @@ class RabbitMQAdapter(FrameworkAdapter):
             if _env_mentions_rabbit(directory):
                 return True
 
+        # Explicit amqp:// in a non-app directory is enough. Soft "rabbitmq"
+        # text alone is not a detection signal.
+        if _env_has_amqp_uri(directory) and not _looks_like_application(directory):
+            return True
+
         return False
 
     def generate_service(
@@ -83,23 +88,35 @@ class RabbitMQAdapter(FrameworkAdapter):
 def _compose_looks_like_rabbit(text: str) -> bool:
     """True for explicit RabbitMQ compose image/service keys (no soft guesses)."""
 
-    if "rabbitmq:3" in text or "image: rabbitmq" in text or "image:rabbitmq" in text:
-        return True
-
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("image:") and "rabbitmq" in stripped:
+        if stripped.startswith("image:") and _compose_image_is_rabbit(stripped):
             return True
         if stripped.startswith("rabbitmq:") or stripped.startswith("rabbit:"):
             return True
 
-    if "5672" in text and ("rabbitmq" in text or "amqp" in text):
-        return True
-
     if any(uri in text for uri in _AMQP_URI_MARKERS):
         return True
 
+    # Port + explicit rabbit/amqp token reinforces shared compose layouts.
+    if "5672" in text and ("rabbitmq" in text or "amqp://" in text or "amqps://" in text):
+        return True
+
     return False
+
+
+def _compose_image_is_rabbit(image_line: str) -> bool:
+    """True for official / common RabbitMQ images (rejects incidental names)."""
+
+    _, _, rest = image_line.partition(":")
+    image = rest.strip().strip("\"'")
+    if not image:
+        return False
+    path = image
+    if "/" in image and ("." in image.split("/", 1)[0] or ":" in image.split("/", 1)[0]):
+        path = image.split("/", 1)[1]
+    name = path.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
+    return name in {"rabbitmq", "rabbit"}
 
 
 def _env_mentions_rabbit(directory: Path) -> bool:
@@ -111,5 +128,38 @@ def _env_mentions_rabbit(directory: Path) -> bool:
         if any(uri in text for uri in _AMQP_URI_MARKERS):
             return True
         if "rabbitmq" in text:
+            return True
+    return False
+
+
+def _env_has_amqp_uri(directory: Path) -> bool:
+    """True only for explicit ``amqp://`` / ``amqps://`` connection strings."""
+
+    for name in (".env", ".env.local", ".env.development", ".env.dev"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        text = read_text(path).lower()
+        if any(uri in text for uri in _AMQP_URI_MARKERS):
+            return True
+    return False
+
+
+def _looks_like_application(directory: Path) -> bool:
+    """True when the directory has a typical application entrypoint."""
+
+    for relative in (
+        "main.py",
+        "app.py",
+        "wsgi.py",
+        "asgi.py",
+        "manage.py",
+        "server.py",
+        "application.py",
+        "package.json",
+        "go.mod",
+        "Cargo.toml",
+    ):
+        if (directory / relative).is_file():
             return True
     return False

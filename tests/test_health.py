@@ -185,23 +185,46 @@ def test_runner_waits_for_http_before_dependent(
         lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
     )
 
-    stop = threading.Event()
-    base = _serve_http_until(ready_after_s=0.8, stop=stop)
-    url = f"{base}/health"
+    # Bind a free port, then have the managed service listen on it after a delay
+    # so health must wait for *our* process (not a foreign listener).
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = int(probe.getsockname()[1])
+    probe.close()
+    url = f"http://127.0.0.1:{port}/health"
     marker = tmp_path / "auth_started"
+    api_script = tmp_path / "api_server.py"
+    api_script.write_text(
+        "import time\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        f"PORT = {port}\n"
+        "time.sleep(0.8)\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    hits = 0\n"
+        "    def do_GET(self):\n"
+        "        H.hits += 1\n"
+        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
+        "    def log_message(self, *a):\n"
+        "        pass\n"
+        "print('api up', flush=True)\n"
+        "srv = HTTPServer(('127.0.0.1', PORT), H)\n"
+        "srv.timeout = 0.5\n"
+        "deadline = time.time() + 4.0\n"
+        "while time.time() < deadline:\n"
+        "    srv.handle_request()\n",
+        encoding="utf-8",
+    )
 
     stack = Stack()
     stack.service(
         name="api",
         path=tmp_path,
-        command=(
-            'python -c "import time; print(\'api up\', flush=True); time.sleep(3)"'
-        ),
+        command=f"{sys.executable} api_server.py",
         health_check={
             "type": "http",
             "url": url,
             "interval": 0.1,
-            "timeout": 5,
+            "timeout": 8,
         },
     )
     stack.service(
@@ -216,25 +239,24 @@ def test_runner_waits_for_http_before_dependent(
         health_check={"type": "process", "interval": 0.05, "timeout": 5},
     )
 
-    try:
-        assert not marker.exists()
-        code = Runner(logs_dir=tmp_path / "logs", poll_interval_s=0.05).run(stack)
-        assert code == 0
-        assert marker.exists()
+    assert not marker.exists()
+    code = Runner(logs_dir=tmp_path / "logs", poll_interval_s=0.05).run(stack)
+    assert code == 0
+    assert marker.exists()
 
-        start_api = next(i for i, line in enumerate(printed) if line == "Starting api...")
-        healthy_api = next(
-            i for i, line in enumerate(printed) if "api healthy" in line
-        )
-        start_auth = next(
-            i for i, line in enumerate(printed) if line == "Starting auth..."
-        )
-        assert start_api < healthy_api < start_auth
-        assert any("Waiting for api..." in line for line in printed)
-        assert any("Starting application services..." in line for line in printed)
-        assert any("Watching for changes..." in line for line in printed)
-    finally:
-        stop.set()
+    start_api = next(i for i, line in enumerate(printed) if line == "Starting api...")
+    healthy_api = next(
+        i for i, line in enumerate(printed) if "api healthy" in line
+    )
+    start_auth = next(
+        i for i, line in enumerate(printed) if line == "Starting auth..."
+    )
+    assert start_api < healthy_api < start_auth
+    assert any("Waiting for api..." in line for line in printed)
+    assert any("Starting application services..." in line for line in printed)
+    assert any("Press Ctrl+C to stop." in line for line in printed)
+    # No reload=True on these services — do not claim a file watcher is active.
+    assert not any("Watching for changes..." in line for line in printed)
 
 
 def test_runner_aborts_on_health_timeout_and_stops_started(

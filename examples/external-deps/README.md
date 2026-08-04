@@ -46,8 +46,8 @@ attempts, dependent services, and a suggested fix.
 
 Health:
 
-- Auth: `http://127.0.0.1:8000/health`
-- Gateway: `http://127.0.0.1:8001/health`
+- Auth: `http://127.0.0.1:8006/health`
+- Gateway: `http://127.0.0.1:8007/health`
 
 ## Graph
 

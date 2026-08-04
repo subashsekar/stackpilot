@@ -26,11 +26,11 @@ stackpilot run
 - **One config file** — declare services and external dependencies in `Stackfile.py`
 - **Auto-discovery** — `stackpilot sync` detects FastAPI, Flask, Django, Celery, Express, NestJS, Postgres, Redis, MongoDB, RabbitMQ, and more
 - **Apps vs infrastructure** — only application services are started; Postgres/Redis are validated as external dependencies
-- **Dependency-aware startup** — services start in topological order
+- **Dependency-aware startup** — independent services start in parallel waves; dependents wait for healthy dependencies
 - **Health checks** — HTTP, TCP, or process liveness before dependents launch
 - **Hot reload** — file changes restart only the affected service
 - **Issue tracker** — actionable crashes under `.stackpilot/issues/`, not endless log files
-- **Doctor** — environment and config diagnostics in one command
+- **Doctor** — environment, runtime integrity, ports, env files, and config diagnostics in one command
 - **No Docker required** for app processes (compose still works for databases)
 
 ---
@@ -89,13 +89,14 @@ root in `.stackpilot/`.
 
 The public CLI for **v0.1.x** is frozen until **v0.2.0**.
 
-Nine commands. One job each.
+Ten commands. One job each.
 
 | Command | Definition |
 |---------|------------|
 | [`init`](#stackpilot-init) | Create a starter `Stackfile.py` |
 | [`sync`](#stackpilot-sync) | Discover nested services and write `Stackfile.py` |
 | [`run`](#stackpilot-run) | Start services in dependency order and stream live logs |
+| [`stop`](#stackpilot-stop) | Terminate leftover processes from `.stackpilot/runtime.json` |
 | [`graph`](#stackpilot-graph) | Print a professional architecture dependency graph |
 | [`status`](#stackpilot-status) | Show runtime status (PID, port, uptime, health) |
 | [`ps`](#stackpilot-ps) | List active StackPilot processes |
@@ -203,8 +204,9 @@ stackpilot stop
 3. Ignores already-dead PIDs and clears stale runtime entries
 4. Prints a short summary (`Stopping auth...` → `✓ N services stopped.`)
 
-If there is no runtime file: `No running StackPilot session.`  
-Corrupted runtime files are cleared without a traceback.
+If there is no runtime file (and no Stackfile project): `No running StackPilot session.`  
+Corrupted runtime files are cleared without a traceback. `stop` does not require a
+`Stackfile.py` when a leftover `.stackpilot/runtime.json` is still present.
 
 ---
 
@@ -214,8 +216,10 @@ Corrupted runtime files are cleared without a traceback.
 services and external dependencies from the Stackfile.
 
 Use this to understand startup order and `depends_on` relationships without
-starting anything. Output includes live status colors when a session is active,
-ports, detected frameworks, and dependency depth.
+starting anything. Output includes the dependency tree, external services,
+dependency depth, topological **startup order**, live status colors when a
+session is active, ports, detected frameworks, and cycle highlighting.
+ASCII fallback is used automatically on cp1252 / limited terminals.
 
 ```bash
 stackpilot graph
@@ -317,7 +321,7 @@ An empty `issues/` directory means the project is healthy.
 ### `stackpilot doctor`
 
 **Definition:** Diagnose the environment, Stackfile, dependency graph, ports,
-health checks, and external dependencies in one report.
+health checks, runtime integrity, and external dependencies in one report.
 
 Use this when sync/run fails, imports break, ports conflict, or Postgres/Redis
 look misconfigured. Exit code is non-zero when errors are present.
@@ -327,8 +331,9 @@ stackpilot doctor
 ```
 
 **Checks include:** Python / package import, Stackfile load, service paths and
-commands, duplicate/free ports, dependency cycles, health-check config, and
-external dependency reachability.
+commands (missing executables), duplicate/free ports, dependency cycles,
+health-check / URL validity, env files, runtime.json integrity, orphan
+processes, project permissions, and external dependency reachability.
 
 ---
 
@@ -350,6 +355,7 @@ stackpilot init
 stackpilot sync
 stackpilot run
 stackpilot run auth
+stackpilot stop
 stackpilot graph
 stackpilot status
 stackpilot ps
@@ -473,8 +479,10 @@ StackPilot distinguishes **application services** from **external dependencies**
 |------|--------------|------------|
 | PostgreSQL (`postgresql` / `postgres`) | `5432` | TCP connect via the Health Engine |
 | Redis (`redis`) | `6379` | TCP connect via the Health Engine |
+| MongoDB (`mongodb` / `mongo`) | `27017` | TCP connect via the Health Engine |
+| RabbitMQ (`rabbitmq` / `amqp`) | `5672` | TCP connect via the Health Engine |
 
-`stackpilot sync` detects Postgres/Redis directories and emits
+`stackpilot sync` detects these directories / compose images and emits
 `stack.external_dependency(...)` — never an executable `stack.service(...)`.
 
 ### How validation works
@@ -738,6 +746,7 @@ and the next action.
 | `No Stackfile.py found` | `stackpilot init` or `stackpilot sync` from the project root |
 | Sync finds nothing | Put each service in a **nested** directory (the project root itself is never a service) |
 | Existing StackPilot session detected | `stackpilot stop` or `stackpilot run --force` |
+| Corrupted runtime status | `stackpilot stop` (clears `.stackpilot/runtime.json`) then re-run |
 | Port already in use | `stackpilot stop`, change `port=` / health URL, or free the port |
 | Executable not found | Activate the project venv or fix `command=` — then `stackpilot doctor` |
 | Permission denied | Check execute bits / antivirus locks on the service path |
@@ -746,6 +755,7 @@ and the next action.
 | Health endpoint missing | Confirm the route exists and matches `health_check=` |
 | Health timeout | Check the run terminal, `stackpilot issues <name>`, then doctor |
 | Service fails on start | `stackpilot issues <name>` and open the referenced `FILE:LINE` |
+| Flask / Werkzeug banners look loud | Startup lines like `* Serving Flask app` are INFO, not ERROR |
 | Import / CLI missing | `pip install stackpilot` then `python -m stackpilot doctor` |
 | Wrong Python / venv | Activate the project venv, or use uv/Poetry/Pipenv so sync emits the right runner |
 | Stackfile load / config error | `stackpilot doctor` — check syntax and that `stack = Stack()` exists |

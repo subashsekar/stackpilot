@@ -397,17 +397,26 @@ def test_startup_failure_diagnostics_format(tmp_path: Path) -> None:
         python_executable=sys.executable,
         comparison=comparison,
         summary=summary,
+        application_output=(
+            "Traceback (most recent call last):\n"
+            '  File "app/dependencies/auth.py", line 12, in <module>\n'
+            "ModuleNotFoundError: No module named \"shared\""
+        ),
     )
-    assert "Application startup failed" in text
-    assert "admin_service" in text
-    assert "Working Directory:" in text
-    assert "Command:" in text
-    assert "Python Executable:" in text
-    assert "Environment Differences:" in text
+    assert "Application Output" in text
     assert "ModuleNotFoundError" in text
     assert 'No module named "shared"' in text
-    assert "app/dependencies/auth.py:12" in text
-    assert "Likely Cause:" in text
+    assert "Problem: Application startup failed" in text
+    assert "Affected service: admin_service" in text
+    assert "Reason:" in text
+    assert "Suggested fix:" in text
+    assert "Command:" in text
+    assert "Working directory:" in text
+    assert "Traceback (most recent call last)" in text
+    # Must not look like a raw StackPilot frame dump.
+    assert "stackpilot/runner.py" not in text
+    assert "Likely Cause:" not in text
+    assert "Application startup failed\nService:" not in text
 
 
 def test_process_cleanup_still_works_after_drain(

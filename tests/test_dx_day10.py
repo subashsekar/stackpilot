@@ -46,17 +46,17 @@ def test_crash_summary_format(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     issues_path.write_text("", encoding="utf-8")
 
     text = format_crash_report(service="payments", exit_code=1, log_path=issues_path)
-    assert "payments exited (Exit Code: 1)" in text
-    assert "Issue recorded:" in text
+    assert "payments exited (exit 1)" in text
+    assert "Issue:" in text
     assert ".stackpilot/issues/payments.issue" in text
-    assert "Remaining services continue running..." in text
+    assert "Remaining services continue running." in text
     assert "restart" not in text.lower()
     assert "Service Failed" not in text
 
 
 def test_ascii_fallback_dx() -> None:
-    raw = "❌ ✗ ✓ → … · ━"
-    assert ascii_fallback_dx(raw) == "X X + -> ... - -"
+    raw = "❌ ✗ ✓ → … · ━ —"
+    assert ascii_fallback_dx(raw) == "X X + -> ... - - -"
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,8 @@ def test_runner_prints_dashboard_and_shutdown(
 
     assert code == 130
     assert "Starting application services..." in joined
-    assert "Watching for changes..." in joined
+    assert "Started 2/2 services" in joined
+    assert "Watching for changes..." not in joined  # no reload=True services
     assert "Press Ctrl+C to stop." in joined
     assert "All services are running." not in joined
     assert "Stopping StackPilot..." in joined
@@ -290,8 +291,8 @@ def test_runner_crash_report_without_restart(
     joined = "\n".join(printed)
 
     assert code == 1
-    assert "payments exited (Exit Code: 1)" in joined
-    assert "Issue recorded:" in joined
-    assert "Remaining services continue running..." in joined
+    assert "payments exited (exit 1)" in joined
+    assert "Issue:" in joined
+    assert "Remaining services continue running." in joined
     assert "Restarting" not in joined
     assert not any("Stopping StackPilot" in line for line in printed)

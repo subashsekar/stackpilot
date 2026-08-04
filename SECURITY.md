@@ -47,6 +47,7 @@ from untrusted sources.
 | Process tree cleanup | Shutdown kills the full child tree (POSIX groups / Windows Job Objects) |
 | External deps never started | Postgres/Redis are TCP-validated only (with retries + timeout) |
 | Friendly failure UX | Expected spawn/config mistakes print Problem / Reason / Suggested fix (no traceback) |
+| Runtime cleanup | Shutdown verifies process trees; doctor reports orphan PIDs / corrupt runtime.json |
 
 ### Out of scope
 

@@ -17,14 +17,25 @@ from .adapters.detect.health_routes import discover_routes
 from .config import HttpHealthCheck, ServiceSpec, Stack
 from .dashboard import (
     ascii_fallback_dx,
-    format_crash_report,
+    color_enabled,
+    format_application_logs_banner,
+    format_runtime_summary,
     format_ready_urls,
     format_shutdown_summary,
+    format_wave_header,
+    format_crash_report,
     print_safe,
+    style_text,
 )
 from .dependency_graph import DependencyGraph
-from .diagnostics.errors import format_health_timeout, format_spawn_failure
-from .health import Health, HealthCheckTimeout
+from .diagnostics.errors import (
+    format_cleanup_failure,
+    format_health_http_failure,
+    format_health_timeout,
+    format_port_already_in_use,
+    format_spawn_failure,
+)
+from .health import Health, HealthCheckTimeout, PortOwnershipError
 from .http_checker import probe_http
 from .launch_env import (
     TracebackSummary,
@@ -49,13 +60,18 @@ def _safe_print(message: str, *, ascii_fallback: str) -> None:
     print_safe(message, ascii_fallback=ascii_fallback)
 
 
-def _print_reload_warning(message: str) -> None:
-    """Print a yellow WARNING line for hot-reload change detection."""
+def _print_reload_detected(paths_display: str) -> None:
+    """Print the change-detection block for hot reload (TTY-aware color)."""
 
-    # Always emit ANSI yellow so Git Bash / Windows still show the warning.
-    # Tests that monkeypatch ``print`` continue to see the raw message.
-    colored = f"\033[1;33m{message}\033[0m"
-    print_safe(colored, ascii_fallback=f"\033[1;33m{ascii_fallback_dx(message)}\033[0m")
+    header = "Detected change:"
+    if color_enabled():
+        header = style_text(header, fg="yellow", bold=True)
+    print_safe(header, ascii_fallback=ascii_fallback_dx("Detected change:"))
+    for raw in paths_display.split(", "):
+        path = raw.strip().strip("'\"")
+        if not path:
+            continue
+        print_safe(path, ascii_fallback=path)
 
 
 class Runner:
@@ -89,11 +105,13 @@ class Runner:
         self._reload_locks: dict[str, threading.Lock] = {}
         self._reload_gate = threading.Lock()
         self._reloading: set[str] = set()
+        self._reload_pending: set[str] = set()
         self._reloading_lock = threading.Lock()
         self._startup_began_mono: Optional[float] = None
         self._shutting_down = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
+        self._in_reload_cycle = False
 
     # ------------------------------------------------------------------
     # Public lifecycle (Orchestrator entry + compat)
@@ -161,6 +179,8 @@ class Runner:
         self._startup_began_mono = None
         with self._reloading_lock:
             self._reloading.clear()
+            self._reload_pending.clear()
+        self._in_reload_cycle = False
 
     def begin_shutdown(self) -> None:
         """
@@ -171,6 +191,8 @@ class Runner:
         """
 
         self._shutting_down = True
+        with self._reloading_lock:
+            self._reload_pending.clear()
         watch_manager = self._watch_manager
         if watch_manager is not None:
             # Cancel pending debounce timers so callbacks cannot fire mid-stop.
@@ -233,6 +255,14 @@ class Runner:
                 spec.health_check,
                 process=managed.process,
             )
+        except PortOwnershipError as exc:
+            friendly = format_port_already_in_use(
+                port=exc.port,
+                service=spec.name,
+            )
+            print_safe(friendly, ascii_fallback=ascii_fallback_dx(friendly))
+            self._status.sync_managed(manager.get(spec.name))
+            return False
         except HealthCheckTimeout:
             # Drain stderr/stdout until EOF so the full traceback is visible
             # before we print diagnostics or tear siblings down.
@@ -271,9 +301,6 @@ class Runner:
             f"✓ {spec.name} healthy ({elapsed:.1f}s)",
             ascii_fallback=f"+ {spec.name} healthy ({elapsed:.1f}s)",
         )
-        url = service_display_url(spec)
-        if url:
-            _safe_print(f"  → {url}", ascii_fallback=f"  -> {url}")
         self._status.sync_managed(manager.get(spec.name))
         return True
 
@@ -298,26 +325,47 @@ class Runner:
 
     def start_all(self, ordered: Sequence[ServiceSpec]) -> bool:
         """
-        Start services in the given order, waiting for each to become healthy.
+        Start services in dependency-safe parallel waves.
 
-        Returns False when a health check times out (startup aborted).
-        On any failure or exception after at least one successful start,
+        Independent services (no mutual depends_on edges among the remaining
+        set) start concurrently. Dependents never start until their
+        dependencies in earlier waves are healthy.
+
+        Returns False when a health check times out or spawn fails (startup
+        aborted). On any failure after at least one successful start,
         already-started services are stopped so no orphans remain.
         """
 
         manager = self._require_manager()
+        logger = self._logger
+        if logger is not None:
+            logger.begin_startup_buffer()
+
         print_safe(
             "Starting application services...",
             ascii_fallback="Starting application services...",
         )
 
+        by_name = {spec.name: spec for spec in ordered}
         ok = True
         try:
-            for spec in ordered:
-                if not self.start(spec):
+            waves = self._startup_waves([spec.name for spec in ordered])
+            show_waves = len(waves) > 1 or len(ordered) > 1
+            for wave_index, wave_names in enumerate(waves, start=1):
+                wave_specs = [by_name[name] for name in wave_names if name in by_name]
+                if not wave_specs:
+                    continue
+                if show_waves:
+                    banner = format_wave_header(
+                        wave_index, [spec.name for spec in wave_specs]
+                    )
+                    print_safe(banner, ascii_fallback=ascii_fallback_dx(banner))
+                started, failed = self._start_wave(wave_specs)
+                if failed:
                     print_safe("Startup aborted.", ascii_fallback="Startup aborted.")
                     ok = False
                     break
+                del started  # reserved for future DX timing
         except BaseException:
             ok = False
             raise
@@ -329,13 +377,59 @@ class Runner:
                     self._stop_started(manager)
                 except Exception:
                     pass
+                self._flush_startup_logs(banner=False)
 
         if ok:
             self._refresh_status()
+            self._print_startup_summary(ordered)
             self._print_ready_urls(ordered)
-            print_safe("Watching for changes...", ascii_fallback="Watching for changes...")
-            print_safe("Press Ctrl+C to stop.", ascii_fallback="Press Ctrl+C to stop.")
+            self._flush_startup_logs(banner=True)
         return ok
+    def print_watch_ready(self, *, watching: bool = True) -> None:
+        """
+        Print the post-startup watch banner.
+
+        Called by ``Orchestrator`` only after ``WatchManager.start`` so the
+        message cannot appear before observers are live. When no watchers
+        were started, only the Ctrl+C hint is shown.
+        """
+
+        if watching:
+            print_safe(
+                "Watching for changes...",
+                ascii_fallback="Watching for changes...",
+            )
+        print_safe("Press Ctrl+C to stop.", ascii_fallback="Press Ctrl+C to stop.")
+
+    def _print_startup_summary(self, ordered: Sequence[ServiceSpec]) -> None:
+        """Print a one-line runtime summary after a successful start."""
+
+        began = self._startup_began_mono
+        if began is None:
+            return
+        elapsed = max(0.0, time.monotonic() - began)
+        total = len(ordered)
+        running = self._status.running_count()
+        summary = format_runtime_summary(
+            started=running,
+            total=total,
+            startup_time_s=elapsed,
+        )
+        print_safe(summary, ascii_fallback=ascii_fallback_dx(summary))
+
+    def _flush_startup_logs(self, *, banner: bool) -> None:
+        """Flush buffered application logs after orchestration messages."""
+
+        logger = self._logger
+        if logger is None:
+            return
+        try:
+            if banner:
+                block = format_application_logs_banner()
+                print_safe(block, ascii_fallback=ascii_fallback_dx(block))
+            logger.flush_startup_buffer()
+        except Exception:
+            pass
 
     def _print_ready_urls(self, ordered: Sequence[ServiceSpec]) -> None:
         """Print a compact list of service URLs after a successful startup."""
@@ -460,7 +554,12 @@ class Runner:
         failures: list[str] = []
         stop_timeout = 0.05 if force else None
 
-        for wave in self._shutdown_waves(names):
+        waves = self._shutdown_waves(names)
+        show_waves = len(waves) > 1
+        for wave_index, wave in enumerate(waves, start=1):
+            if show_waves and first_entry:
+                banner = format_wave_header(wave_index, wave)
+                print_safe(banner, ascii_fallback=ascii_fallback_dx(banner))
             wave_stopped, wave_failed = self._stop_wave(
                 manager, wave, timeout_s=stop_timeout
             )
@@ -474,6 +573,39 @@ class Runner:
             )
             print_safe(msg, ascii_fallback=ascii_fallback_dx(msg))
 
+        # Final orphan sweep: force-kill anything still alive, then verify.
+        remaining_pids: list[int] = []
+        for managed in manager.services():
+            proc = managed.process
+            pid = managed.pid or managed.last_pid
+            if proc is not None and proc.poll() is None and proc.pid is not None:
+                try:
+                    from .process_tree import signal_process_tree
+
+                    signal_process_tree(proc.pid, graceful=False)
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            check_pid = managed.pid or managed.last_pid or (proc.pid if proc else None)
+            if isinstance(check_pid, int):
+                from .status import pid_is_alive
+
+                if pid_is_alive(check_pid):
+                    remaining_pids.append(check_pid)
+
+        if remaining_pids or failures:
+            orphan_msg = format_cleanup_failure(remaining_pids=remaining_pids)
+            print_safe(orphan_msg, ascii_fallback=ascii_fallback_dx(orphan_msg))
+
+        # Drain pumps / prune threads so shutdown leaves no leaked I/O workers.
+        try:
+            manager._prune_completed_threads()
+        except Exception:
+            pass
+
         elapsed = max(0.0, time.monotonic() - began)
         summary = format_shutdown_summary(
             stopped_names=stopped,
@@ -481,7 +613,51 @@ class Runner:
             shutdown_time_s=elapsed,
         )
         print_safe(summary, ascii_fallback=ascii_fallback_dx(summary))
-        return 1 if failures else 130
+        return 1 if (failures or remaining_pids) else 130
+
+    def verify_cleanup(self) -> dict[str, object]:
+        """
+        Post-shutdown integrity snapshot for tests and doctor tooling.
+
+        Returns a dict describing leftover processes, pump threads, and watchers.
+        Never raises.
+        """
+
+        result: dict[str, object] = {
+            "orphan_pids": [],
+            "alive_pump_threads": 0,
+            "watched_services": [],
+            "ok": True,
+        }
+        try:
+            manager = self._manager
+            if manager is not None:
+                orphans: list[int] = []
+                for managed in manager.services():
+                    pid = managed.pid or managed.last_pid
+                    if isinstance(pid, int):
+                        from .status import pid_is_alive
+
+                        if pid_is_alive(pid):
+                            orphans.append(pid)
+                try:
+                    manager._prune_completed_threads()
+                except Exception:
+                    pass
+                alive_pumps = sum(1 for t in manager._threads if t.is_alive())
+                result["orphan_pids"] = orphans
+                result["alive_pump_threads"] = alive_pumps
+            watch = self._watch_manager
+            if watch is not None:
+                result["watched_services"] = list(watch.watched_services)
+            result["ok"] = (
+                not result["orphan_pids"]
+                and int(result["alive_pump_threads"]) == 0
+                and not result["watched_services"]
+            )
+        except Exception:
+            result["ok"] = False
+        return result
 
     def on_reload(self, name: str, changed_paths: Sequence[str] = ()) -> None:
         """
@@ -505,43 +681,66 @@ class Runner:
         if lock is None:
             lock = self._reload_gate
 
-        # Non-blocking acquire drops overlapping reload requests for the same
-        # service (prevents double-reload storms under bursty FS events).
+        # Non-blocking acquire coalesces overlapping reload requests: mark
+        # pending and run exactly one follow-up after the in-flight reload.
         if not lock.acquire(blocking=False):
+            with self._reloading_lock:
+                self._reload_pending.add(name)
             return
         try:
-            if self._shutting_down or self._manager is None:
-                return
-            with self._reloading_lock:
-                self._reloading.add(name)
-            try:
-                try:
-                    managed = manager.get(name)
-                except KeyError:
+            pending_paths: Sequence[str] = changed_paths
+            while True:
+                if self._shutting_down or self._manager is None:
                     return
-                spec = managed.spec
-
-                display = format_changed_paths(
-                    changed_paths,
-                    relative_to=self._project_root or Path.cwd(),
-                )
-                _print_reload_warning(
-                    f"WARNING StackPilot detected changes in {display}. Reloading..."
-                )
-                self._restart_with_health(manager, spec)
-
-                if spec.restart_dependents and graph is not None:
-                    for dep_name in graph.dependents(name, transitive=True):
-                        if self._shutting_down:
-                            return
-                        try:
-                            dep_spec = manager.get(dep_name).spec
-                        except KeyError:
-                            continue
-                        self._restart_with_health(manager, dep_spec)
-            finally:
                 with self._reloading_lock:
-                    self._reloading.discard(name)
+                    self._reloading.add(name)
+                    self._reload_pending.discard(name)
+                try:
+                    try:
+                        managed = manager.get(name)
+                    except KeyError:
+                        return
+                    spec = managed.spec
+
+                    display = format_changed_paths(
+                        pending_paths,
+                        relative_to=self._project_root or Path.cwd(),
+                    )
+                    _print_reload_detected(display)
+                    began = time.monotonic()
+                    self._in_reload_cycle = True
+                    try:
+                        ok = self._restart_with_health(manager, spec)
+
+                        if ok and spec.restart_dependents and graph is not None:
+                            for dep_name in graph.dependents(name, transitive=True):
+                                if self._shutting_down:
+                                    return
+                                try:
+                                    dep_spec = manager.get(dep_name).spec
+                                except KeyError:
+                                    continue
+                                if not self._restart_with_health(manager, dep_spec):
+                                    ok = False
+                                    break
+
+                        if ok:
+                            elapsed = max(0.0, time.monotonic() - began)
+                            _safe_print(
+                                f"✓ Reloaded in {elapsed:.1f}s",
+                                ascii_fallback=f"+ Reloaded in {elapsed:.1f}s",
+                            )
+                    finally:
+                        self._in_reload_cycle = False
+                finally:
+                    with self._reloading_lock:
+                        self._reloading.discard(name)
+                        again = name in self._reload_pending
+                        if again:
+                            self._reload_pending.discard(name)
+                if not again or self._shutting_down:
+                    return
+                pending_paths = ()
         finally:
             lock.release()
 
@@ -575,7 +774,7 @@ class Runner:
         print_safe(report, ascii_fallback=ascii_fallback_dx(report))
 
     def _print_health_failure(self, spec: ServiceSpec, *, process) -> None:
-        """Emit adaptive health diagnostics when an HTTP probe fails."""
+        """Emit Problem / Reason / Suggested fix for HTTP health probe failures."""
 
         check = spec.health_check
         if not isinstance(check, HttpHealthCheck):
@@ -600,32 +799,29 @@ class Runner:
         discovered = discover_routes(Path(spec.path), framework) if framework else []
         configured = path_from_url(url)
 
-        if probe.kind == "not_found" and (process_alive or tcp_ok):
-            report = format_health_diagnostic(
-                configured_path=configured,
-                probe=probe,
-                discovered_routes=discovered,
-                application_running=True,
-            )
-            print_safe(report, ascii_fallback=ascii_fallback_dx(report))
-            return
-
-        if probe.kind == "refused":
-            report = "Connection refused\n\nApplication not started."
-            print_safe(report, ascii_fallback=report)
-            return
-
+        # Timeout is already covered by format_health_timeout in the caller.
         if probe.kind == "timeout":
-            report = "Timeout\n\nApplication unhealthy."
-            print_safe(report, ascii_fallback=report)
             return
 
-        if probe.kind == "failed":
-            report = (
-                f"Detected health endpoint\n\n{configured}\n\n"
-                f"Status\n\n{probe.detail}\n\nHealth failed."
+        if probe.kind in {"not_found", "failed", "refused"}:
+            report = format_health_http_failure(
+                service=spec.name,
+                health_url=url,
+                kind=probe.kind,
+                detail=probe.detail or "",
+                configured_path=configured,
+                discovered_routes=discovered,
             )
             print_safe(report, ascii_fallback=ascii_fallback_dx(report))
+            # Keep adaptive route hints as secondary application guidance.
+            if probe.kind == "not_found" and (process_alive or tcp_ok) and discovered:
+                extra = format_health_diagnostic(
+                    configured_path=configured,
+                    probe=probe,
+                    discovered_routes=discovered,
+                    application_running=True,
+                )
+                print_safe(extra, ascii_fallback=ascii_fallback_dx(extra))
             return
 
         if not discovered and tcp_ok:
@@ -675,6 +871,13 @@ class Runner:
             comparison = compare_launch_plans(actual, expected)
 
         summary = self._traceback_summary_for(name)
+        application_output = None
+        logger = self._logger
+        if logger is not None:
+            try:
+                application_output = logger.issue_tracker.last_application_output(name)
+            except Exception:
+                application_output = None
         report = format_startup_failure_report(
             service=name,
             cwd=cwd,
@@ -682,6 +885,7 @@ class Runner:
             python_executable=python_exe,
             comparison=comparison,
             summary=summary,
+            application_output=application_output,
         )
         print_safe(report, ascii_fallback=ascii_fallback_dx(report))
 
@@ -732,6 +936,89 @@ class Runner:
         names.reverse()
         for wave in self._shutdown_waves(names):
             self._stop_wave(manager, wave)
+
+    def _startup_waves(self, names: Sequence[str]) -> list[list[str]]:
+        """
+        Partition ``names`` into start waves that respect dependencies.
+
+        Within a wave, no member depends on another member still waiting to
+        start, so all may start concurrently. Across waves, dependencies always
+        become healthy before their dependents (User → Auth → Gateway).
+        """
+
+        remaining = set(names)
+        if not remaining:
+            return []
+
+        graph = self._graph
+        order_index = {name: index for index, name in enumerate(names)}
+        waves: list[list[str]] = []
+
+        while remaining:
+            if graph is None:
+                wave = sorted(remaining, key=lambda n: order_index.get(n, 0))
+                waves.append(wave)
+                break
+
+            can_start: list[str] = []
+            for name in remaining:
+                deps = [
+                    dep
+                    for dep in graph.edges.get(name, ())
+                    if dep in remaining and dep in graph.specs
+                ]
+                if not deps:
+                    can_start.append(name)
+
+            if not can_start:
+                # Cycle / incomplete graph: peel one name in display order.
+                can_start = [min(remaining, key=lambda n: order_index.get(n, 0))]
+
+            can_start.sort(key=lambda n: order_index.get(n, 0))
+            waves.append(can_start)
+            remaining.difference_update(can_start)
+
+        return waves
+
+    def _start_wave(
+        self,
+        specs: Sequence[ServiceSpec],
+    ) -> tuple[list[str], list[str]]:
+        """
+        Start ``specs`` concurrently (spawn + health wait).
+
+        Returns ``(started, failed)`` preserving wave display order.
+        """
+
+        if not specs:
+            return [], []
+
+        if len(specs) == 1:
+            ok = self.start(specs[0])
+            if ok:
+                return [specs[0].name], []
+            return [], [specs[0].name]
+
+        results: dict[str, bool] = {}
+
+        def _start_one(spec: ServiceSpec) -> tuple[str, bool]:
+            return spec.name, self.start(spec)
+
+        workers = min(len(specs), 32)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_start_one, spec) for spec in specs]
+            for future in as_completed(futures):
+                name, ok = future.result()
+                results[name] = ok
+
+        started: list[str] = []
+        failed: list[str] = []
+        for spec in specs:
+            if results.get(spec.name, False):
+                started.append(spec.name)
+            else:
+                failed.append(spec.name)
+        return started, failed
 
     def _shutdown_waves(self, names: Sequence[str]) -> list[list[str]]:
         """
@@ -843,7 +1130,11 @@ class Runner:
                 stopped.append(name)
         return stopped, failed
 
-    def _restart_with_health(self, manager: ProcessManager, spec: ServiceSpec) -> bool:
+    def _restart_with_health(
+        self,
+        manager: ProcessManager,
+        spec: ServiceSpec,
+    ) -> bool:
         """Gracefully restart one service and wait for its health check."""
 
         print_safe(
@@ -860,10 +1151,6 @@ class Runner:
             )
             return False
 
-        print_safe(
-            f"Waiting for {spec.name}...",
-            ascii_fallback=f"Waiting for {spec.name}...",
-        )
         try:
             elapsed = Health.wait_until_healthy(
                 spec.name,
@@ -884,10 +1171,12 @@ class Runner:
             )
             return False
 
-        _safe_print(
-            f"✓ {spec.name} reloaded ({elapsed:.1f}s)",
-            ascii_fallback=f"+ {spec.name} reloaded ({elapsed:.1f}s)",
-        )
+        # Watch-driven reloads print a single cycle summary in ``on_reload``.
+        if not self._in_reload_cycle:
+            _safe_print(
+                f"✓ Reloaded in {elapsed:.1f}s",
+                ascii_fallback=f"+ Reloaded in {elapsed:.1f}s",
+            )
         self._status.sync_managed(manager.get(spec.name))
         return True
 
@@ -902,11 +1191,18 @@ def _guess_framework(spec: ServiceSpec) -> str:
         return "Django"
     if "nest" in command:
         return "NestJS"
-    if "express" in command or "node" in command or "npm" in command:
-        # Prefer Express discovery for generic Node; Nest wins when decorators exist.
-        from .adapters.detect.health_routes import discover_nestjs_routes
+    if "express" in command:
+        return "Express"
+    # Ambiguous Node launchers (``npm run start:dev``, ``node …``): prefer
+    # NestJS/Express from the adapter registry so Nest is not mislabeled.
+    if any(token in command for token in ("npm", "npx", "node", "pnpm", "yarn", "bun")):
+        try:
+            from .adapters import default_registry
 
-        if discover_nestjs_routes(Path(spec.path)):
-            return "NestJS"
+            adapter = default_registry.match(Path(spec.path))
+            if adapter is not None and adapter.name in {"NestJS", "Express"}:
+                return adapter.name
+        except Exception:
+            pass
         return "Express"
     return ""

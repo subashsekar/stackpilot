@@ -560,8 +560,13 @@ def test_format_active_report(tmp_path: Path) -> None:
         heading="ACTIVE ISSUES",
         empty_message="✓ No active service issues.",
     )
-    assert "auth\nDatabase connection refused (database.py:42)" in text
-    assert "notifications\nSMTP authentication failed" in text
+    assert "TIME" in text and "SERVICE" in text and "SEVERITY" in text
+    assert "STATUS" in text and "REASON" in text and "RESOLUTION" in text
+    assert "auth" in text
+    assert "Database connection refused" in text
+    assert "database.py:42" in text
+    assert "notifications" in text
+    assert "SMTP authentication failed" in text
     tracker.close()
 
 

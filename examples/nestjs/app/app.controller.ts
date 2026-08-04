@@ -6,4 +6,9 @@ export class AppController {
   root() {
     return { ok: true };
   }
+
+  @Get("health")
+  health() {
+    return { ok: true };
+  }
 }

@@ -142,52 +142,108 @@ def build_child_env(
     base: Optional[Mapping[str, str]] = None,
     services: Sequence[ServiceSpec] = (),
     external_dependencies: Sequence[ExternalDependency] = (),
+    env: Optional[Mapping[str, str]] = None,
+    env_file: Optional[Union[str, Path]] = None,
 ) -> Dict[str, str]:
     """
     Build the environment for a service subprocess.
 
     Starts from ``base`` (default: ``os.environ``), layers service ``.env``
-    files without overriding existing keys, and when a local venv is present
-    sets ``VIRTUAL_ENV`` and prepends the venv scripts/bin directory to
-    ``PATH``. When stack topology is provided, injects service discovery env
-    vars so frontends and sibling services can connect without hardcoded URLs.
+    files without overriding existing keys, applies an explicit ``env_file``
+    then ``env={}`` from the Stackfile (those override), and when a local
+    venv is present sets ``VIRTUAL_ENV`` and prepends the venv scripts/bin
+    directory to ``PATH``. When stack topology is provided, injects service
+    discovery env vars so frontends and sibling services can connect without
+    hardcoded URLs.
 
     When the service declares ``port=`` in the Stackfile, also sets ``PORT`` /
     framework listen env keys (without overriding values already present from
     the parent environment or ``.env``) so Node / Flask apps bind the same
     port StackPilot health-checks.
+
+    Never mutates the caller's ``base`` mapping or ``os.environ``.
     """
 
     root = Path(service_path).expanduser().resolve()
-    env: Dict[str, str] = dict(base if base is not None else os.environ)
+    child: Dict[str, str] = dict(base if base is not None else os.environ)
 
     # Force line-oriented logs when stdout/stderr are pipes (not a TTY).
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("PYTHONIOENCODING", "utf-8")
+    child["PYTHONUNBUFFERED"] = "1"
+    child.setdefault("PYTHONIOENCODING", "utf-8")
 
     for path in _dotenv_files(root):
         for key, value in _parse_dotenv(path).items():
-            env.setdefault(key, value)
+            child.setdefault(key, value)
+
+    # Explicit Stackfile env_file / env win over auto-discovered dotenv and
+    # the inherited parent environment for those keys only.
+    file_path = env_file
+    mapping_env: Mapping[str, str] = env or {}
+    if file_path is None and not mapping_env:
+        matched = _matching_service_spec(root, services=services)
+        if matched is not None:
+            file_path = matched.env_file
+            mapping_env = matched.env
+
+    if file_path is not None:
+        resolved_file = _resolve_env_file(root, file_path)
+        if resolved_file is not None:
+            child.update(_parse_dotenv(resolved_file))
+
+    if mapping_env:
+        child.update({str(k): str(v) for k, v in mapping_env.items()})
 
     venv = detect_venv_dir(root)
     if venv is not None:
         venv_resolved = venv.resolve()
-        env["VIRTUAL_ENV"] = str(venv_resolved)
+        child["VIRTUAL_ENV"] = str(venv_resolved)
         bin_dir = _venv_bin_dir(venv_resolved)
         if bin_dir is not None:
-            current = env.get("PATH", "")
+            current = child.get("PATH", "")
             prefix = str(bin_dir)
             parts = current.split(os.pathsep) if current else []
             if not parts or Path(parts[0]).resolve() != bin_dir.resolve():
-                env["PATH"] = prefix + (os.pathsep + current if current else "")
+                child["PATH"] = prefix + (os.pathsep + current if current else "")
 
-    _inject_listen_port_env(env, root, services=services)
+    _inject_listen_port_env(child, root, services=services)
     _inject_service_connection_env(
-        env,
+        child,
         services=services,
         external_dependencies=external_dependencies,
     )
-    return env
+    return child
+
+
+def _matching_service_spec(
+    service_path: Path,
+    *,
+    services: Sequence[ServiceSpec],
+) -> Optional[ServiceSpec]:
+    try:
+        resolved = service_path.expanduser().resolve()
+    except OSError:
+        return None
+    for spec in services:
+        try:
+            if Path(spec.path).expanduser().resolve() == resolved:
+                return spec
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_env_file(service_root: Path, env_file: Union[str, Path]) -> Optional[Path]:
+    """Resolve ``env_file`` against the service directory; ``None`` if missing."""
+
+    raw = Path(env_file).expanduser()
+    path = raw if raw.is_absolute() else (service_root / raw)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if resolved.is_file():
+        return resolved
+    return None
 
 
 def _inject_listen_port_env(
@@ -240,6 +296,8 @@ def expected_launch_plan(
         base=base_env,
         services=services,
         external_dependencies=external_dependencies,
+        env=spec.env,
+        env_file=spec.env_file,
     )
     argv = tuple(resolve_service_argv(spec.command, cwd=cwd, env=env))
     return LaunchPlan(
@@ -351,6 +409,12 @@ def infer_likely_cause(
             hints.append("Missing PYTHONPATH")
         if "Python executable mismatch" not in hints and "Virtual environment not applied" not in hints:
             hints.append("Wrong Python interpreter / environment")
+    elif exc in {"SyntaxError", "IndentationError"} or "SyntaxError" in msg:
+        hints.append("Invalid Python syntax in application code")
+    elif "Cannot find module" in msg or "MODULE_NOT_FOUND" in msg:
+        hints.append("Missing Node.js dependency or wrong working directory")
+    elif exc.endswith("Error") and exc not in {"", "Error"}:
+        hints.append(f"{exc} raised during application startup")
 
     if not hints:
         hints.append("Application process exited during startup")
@@ -366,6 +430,36 @@ def infer_likely_cause(
     return ", or ".join(ordered)
 
 
+def suggest_startup_fix(
+    summary: Optional[TracebackSummary],
+    comparison: Optional[LaunchComparison],
+) -> str:
+    """Actionable Suggested fix line for application startup failures."""
+
+    cause = infer_likely_cause(summary, comparison).lower()
+    if "pythonpath" in cause or "module named" in (
+        (summary.exception_message or "") if summary else ""
+    ).lower():
+        return (
+            "Install the missing package in the service venv, or fix PYTHONPATH / "
+            "imports, then re-run."
+        )
+    if "syntax" in cause:
+        return "Fix the syntax error in the reported file, then re-run."
+    if "node" in cause or "module_not_found" in cause:
+        return "Run npm/pnpm/yarn install in the service directory, then re-run."
+    if "working directory" in cause:
+        return "Fix path= in Stackfile.py so it points at the service directory."
+    if "virtual environment" in cause or "interpreter" in cause:
+        return "Activate or recreate the service venv, install dependencies, then re-run."
+    if summary and summary.file_line:
+        return f"Inspect {summary.file_line}, fix the application error, then re-run."
+    return (
+        "Inspect Application Output above (and stackpilot issues <service>), "
+        "fix the application error, then re-run."
+    )
+
+
 def format_startup_failure_report(
     *,
     service: str,
@@ -374,47 +468,78 @@ def format_startup_failure_report(
     python_executable: str,
     comparison: Optional[LaunchComparison] = None,
     summary: Optional[TracebackSummary] = None,
+    application_output: Optional[str] = None,
 ) -> str:
-    """Build the developer-facing Application startup failed block."""
+    """
+    Build the developer-facing application failure block.
 
-    env_block = (
-        format_env_differences(comparison)
-        if comparison is not None
-        else "(unavailable)"
-    )
-    # Keep multi-line env diffs indented under the label.
-    if "\n" in env_block:
-        env_block = "\n".join(
-            env_block.splitlines()[:1]
-            + [f"  {line}" for line in env_block.splitlines()[1:]]
-        )
+    Format::
 
-    if summary and summary.exception_type:
-        first_exc = summary.exception_type
-        if summary.exception_message:
-            first_exc = f"{summary.exception_type}: {summary.exception_message}"
+        Application Output
+
+        <real traceback / stderr>
+
+        Problem: ...
+        Reason: ...
+        Suggested fix: ...
+
+    Never includes a StackPilot traceback. Application output is preserved.
+    """
+
+    del python_executable  # retained for call-site compatibility
+
+    output = (application_output or "").strip()
+    if not output and summary is not None:
+        bits: List[str] = []
+        if summary.exception_type:
+            line = summary.exception_type
+            if summary.exception_message:
+                line = f"{summary.exception_type}: {summary.exception_message}"
+            bits.append(line)
+        elif summary.exception_message:
+            bits.append(summary.exception_message)
         if summary.file_line:
-            first_exc = f"{first_exc} ({summary.file_line})"
-    elif summary and summary.exception_message:
-        first_exc = summary.exception_message
-    else:
-        first_exc = "(see stderr traceback above)"
+            bits.append(f"  at {summary.file_line}")
+        output = "\n".join(bits)
+    if not output:
+        output = "(no application output captured)"
 
-    likely = infer_likely_cause(summary, comparison)
+    reason = infer_likely_cause(summary, comparison)
+    if summary and summary.exception_type:
+        detail = summary.exception_type
+        if summary.exception_message:
+            detail = f"{summary.exception_type}: {summary.exception_message}"
+        if summary.file_line:
+            detail = f"{detail} ({summary.file_line})"
+        if reason and detail.lower() not in reason.lower():
+            reason = f"{detail}. {reason}"
+        else:
+            reason = detail
 
-    return "\n".join(
-        [
-            "",
-            "Application startup failed",
-            f"Service: {service}",
-            f"Working Directory: {cwd}",
-            f"Command: {command}",
-            f"Python Executable: {python_executable or '(n/a)'}",
-            f"Environment Differences: {env_block}",
-            f"First Exception: {first_exc}",
-            f"Likely Cause: {likely}",
-        ]
-    )
+    suggested = suggest_startup_fix(summary, comparison)
+    extra = [
+        f"Command: {command}",
+        f"Working directory: {cwd}",
+    ]
+    if comparison is not None and comparison.has_differences:
+        env_block = format_env_differences(comparison)
+        if env_block and env_block != "(none)":
+            extra.append(f"Environment differences: {env_block.splitlines()[0]}")
+
+    lines = [
+        "",
+        "Application Output",
+        "",
+        output,
+        "",
+        "Problem: Application startup failed",
+        f"Affected service: {service}",
+        f"Reason: {reason}",
+        f"Suggested fix: {suggested}",
+        "",
+        *extra,
+    ]
+    return "\n".join(lines)
 
 
 def _resolve_python_launcher(

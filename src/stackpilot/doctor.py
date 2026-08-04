@@ -20,6 +20,12 @@ from .diagnostics.python_check import (
     check_package_import,
     check_python_version,
 )
+from .diagnostics.runtime_check import (
+    check_env_files,
+    check_orphan_processes,
+    check_project_permissions,
+    check_runtime_integrity,
+)
 from .diagnostics.service_check import check_services
 from .diagnostics.summary import format_doctor_report
 
@@ -55,6 +61,10 @@ def run_doctor(*, start: Optional[Path] = None) -> DoctorReport:
             check_dependencies(ctx)
             check_health_configuration(ctx)
             check_external_dependencies(ctx)
+            check_env_files(ctx)
+            check_runtime_integrity(ctx)
+            check_orphan_processes(ctx)
+            check_project_permissions(ctx)
     else:
         check_inside_project(ctx)
         check_stackfile_loads(ctx)

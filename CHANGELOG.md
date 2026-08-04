@@ -7,37 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Configurable external-dependency retries (`retries`, `retry_delay`,
-  `retry_backoff=fixed|exponential`) with progress lines
-  (`Checking…` / `Attempt n/m…` / `Connected.`).
-- Richer dependency-unavailable messages (host, port, elapsed time, attempts,
-  dependents, suggested fix).
-- Consistent CLI error blocks: **Problem / Affected service / Reason /
-  Suggested fix** for spawn failures, health timeouts, bad paths, and
-  configuration errors.
-- Integration and packaging regression tests (wheel install, console script,
-  `python -m stackpilot`, README/example smoke checks).
-- CI matrix expanded to Python 3.10–3.13 on Ubuntu, Windows, and macOS;
-  package job runs pytest artifacts through `twine check`, wheel install,
-  and CLI verification (console script, doctor, and `python -m stackpilot`).
-- `examples/minimal/` runnable single-service sample.
-- `FAQ.md` index linking to the README FAQ / troubleshooting sections.
-- README Known Limitations section; expanded Troubleshooting / FAQ for
-  Ctrl+C, health checks, external deps, hot reload, and the issues workflow.
-
-### Changed
-
-- Default external probe window: interval `0.5s`, timeout `10s`, `5` retries
-  (still overridable per dependency / health_check).
-- Display labels for MongoDB / RabbitMQ external dependency types.
-
-### Fixed
-
-- Spawn errors (including invalid commands) are converted to friendly CLI
-  messages inside Runner / Orchestrator instead of raw tracebacks.
-
 ## [0.1.0] - 2026-07-31
 
 ### Added
@@ -55,18 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Django `manage.py runserver` on Windows is taken over by StackPilot reload
   (`--noreload` + file watcher), so file changes restart the full process and
   URLs stay available after failed Django auto-reloads.
-- `examples/` — minimal FastAPI, Flask, Django, Celery, Express, NestJS, and
-  external-deps (Postgres + Redis) projects with generated `Stackfile.py` files.
+- `examples/` — minimal FastAPI, Flask, Django, Celery, Express, NestJS,
+  `minimal`, and external-deps (Postgres + Redis) projects with generated
+  `Stackfile.py` files. HTTP examples use unique ports (`8001`–`8007`).
 - Checked-in dependency QA fixture under `tests/fixtures/stackpilot-test/`.
 - `SECURITY.md` with supported versions, private reporting guidance, and threat model.
 - **Issue Tracker** under `.stackpilot/issues/` — one compact
   `<service>.issue` table per service (TIME / STATUS / ERROR / FILE:LINE).
   Tracebacks are reduced to message + location. ACTIVE → FIXED → 1h row
   removal; empty files are deleted. An empty `issues/` dir means healthy.
-- CLI command `stackpilot issues` (optional service filter, `--fixed`).
-- CLI command `stackpilot ps` (active processes).
+- Frozen public CLI for v0.1.x: `init`, `sync`, `run`, `stop`, `graph`,
+  `status`, `ps`, `issues`, `doctor`, `version`.
 - On-disk runtime snapshot (`.stackpilot/runtime.json`) for cross-terminal
-  `status` / `ps`.
+  `status` / `ps` / leftover `stop`.
 - Optional `port=` on `stack.service(...)` for DX display when health checks
   do not expose a port.
 - Automatic port detection for `status` / `ps`: live listen sockets,
@@ -78,16 +48,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shutdown summary with per-service stops and total shutdown time.
 - Console log lines include timestamp, service name, and detectable log level (with color).
 - `stackpilot doctor` developer diagnostics package (`stackpilot.diagnostics`) with
-  Stackfile, Python, service path/command, port, dependency-graph, and health-check
-  validation; colored ✓ / ✗ / ! report grouped into Environment / Dependencies /
-  Ports / Health Checks / Configuration sections plus Checks Passed / Warnings /
-  Errors summary.
+  Stackfile, Python, service path/command, port, dependency-graph, health-check,
+  runtime integrity, orphan process, env-file, and permission validation; colored
+  ✓ / ✗ / ! report grouped into Environment / Dependencies / Ports / Health Checks /
+  Configuration sections plus Checks Passed / Warnings / Errors summary.
 - PEP 561 typing marker (`py.typed`) shipped with the package.
 - External dependency validation retries with timeout before failing startup.
+- Configurable external-dependency retries (`retries`, `retry_delay`,
+  `retry_backoff=fixed|exponential`) with progress lines
+  (`Checking…` / `Attempt n/m…` / `Connected.`).
+- Richer dependency-unavailable messages (host, port, elapsed time, attempts,
+  dependents, suggested fix).
+- Consistent CLI error blocks: **Problem / Affected service / Reason /
+  Suggested fix** for spawn failures, health timeouts, bad paths, missing
+  Stackfile, corrupted runtime, and configuration errors.
+- Parallel dependency-safe **startup waves** (independent tiers start
+  concurrently; dependents still wait for healthy dependencies).
+- `stackpilot graph` startup-order section, cycle highlighting, richer ASCII
+  fallback for cp1252 / limited terminals.
 - Friendly CLI diagnosis for spawn failures (missing executable, permission denied,
   missing directory, invalid command).
 - Runtime rejection of non-`http`/`https` health URL schemes and watch paths outside
   the project root.
+- Performance / leak regression tests (startup, shutdown, reload coalesce,
+  graph generation, parallel-start timing).
+- Integration and packaging regression tests (wheel install, console script,
+  `python -m stackpilot`, README/example smoke checks).
+- CI matrix expanded to Python 3.10–3.13 on Ubuntu, Windows, and macOS;
+  package job runs pytest artifacts through `twine check`, wheel install,
+  and CLI verification (console script, doctor, and `python -m stackpilot`).
+- `FAQ.md` index linking to the README FAQ / troubleshooting sections.
+- README Known Limitations section; expanded Troubleshooting / FAQ for
+  Ctrl+C, health checks, external deps, hot reload, and the issues workflow.
 
 ### Changed
 
@@ -103,7 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PyPI metadata: richer description/keywords, Repository + Bug Tracker URLs,
   `build` optional for packaging validation.
 - CLI UX: one command = one responsibility. `stackpilot run` only starts services
-  and streams logs; runtime tables live under `status` / `ps`.
+  and streams logs; runtime tables live under `status` / `ps`; leftover sessions
+  are cleaned with `stop` or `run --force`.
 - Persistent log files (`.stackpilot/logs/`) replaced by the Issue Tracker
   (`.stackpilot/issues/`). Console streaming is unchanged; only persistence
   changed. `stackpilot logs` is replaced by `stackpilot issues`.
@@ -112,6 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subdirectory.
 - Shutdown sequence: disable reload → stop processes → stop watchers → unbind →
   logger shutdown (prevents Ctrl+C vs reload races).
+- Default external probe window: interval `0.5s`, timeout `10s`, `5` retries
+  (still overridable per dependency / health_check).
+- Display labels for MongoDB / RabbitMQ external dependency types.
+- Flask / Werkzeug informational startup banners on stderr are shown as INFO
+  (not ERROR) and are not recorded as crash issues.
+- Graph / route framework labeling: ambiguous `npm` / `node` commands resolve
+  via the adapter registry so NestJS (`npm run start:dev`) is labeled NestJS,
+  not Express.
 
 ### Fixed
 
@@ -135,14 +136,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dynamic version; `click` declared as a direct dependency.
 - Child-process stop path always force-kills the process tree after Job Object
   terminate (Windows) / process-group signal (POSIX).
+- Spawn errors (including invalid commands) are converted to friendly CLI
+  messages inside Runner / Orchestrator instead of raw tracebacks.
+- **Windows hot reload:** `ReadDirectoryChangesW` can notify before the writer
+  flushes new mtime/size; the signature gate previously discarded those events
+  and reloads never fired. StackPilot now uses staggered deferred rechecks
+  (≈80ms / 220ms / 450ms), starts watchers before printing
+  `Watching for changes...`, coalesces overlapping reload requests into one
+  follow-up restart, and surfaces reload-callback errors instead of swallowing
+  them.
 
 ### Removed
 
 - `.stackpilot/logs/` service log file persistence and `stackpilot logs`.
 - Startup dashboard helpers formerly unused after the run UX split
   (`format_startup_dashboard` and related helpers).
-- Public CLI commands `stackpilot stop` and `stackpilot restart`. v0.1.0 is a
-  foreground tool: start with `stackpilot run`, stop with Ctrl+C; hot reload
-  remains automatic via WatchManager. The out-of-band `runtime_control` module
-  was removed with those commands (also eliminated the duplicate
-  `UnknownServiceError` definition).
+- Public CLI command `stackpilot restart` (use hot reload while `run` is active,
+  or stop and re-run). Out-of-band `runtime_control` was removed with that
+  command (also eliminated the duplicate `UnknownServiceError` definition).

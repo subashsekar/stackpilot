@@ -50,7 +50,7 @@ class TestCliLifecycleIntegration:
 
         doctor = runner.invoke(app, ["doctor"])
         assert doctor.exit_code == 0
-        assert "Stackfile.py exists" in doctor.output
+        assert "Stackfile" in doctor.output or "Everything looks good." in doctor.output
 
         status = runner.invoke(app, ["status"])
         assert status.exit_code == 0

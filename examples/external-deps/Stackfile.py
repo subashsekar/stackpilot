@@ -21,18 +21,18 @@ stack.external_dependency(
 stack.service(
     name="auth",
     path="./auth",
-    command="python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000",
-    port=8000,
-    health_check=HttpHealthCheck(url="http://127.0.0.1:8000/health"),
+    command="python -m uvicorn main:app --reload --host 0.0.0.0 --port 8006",
+    port=8006,
+    health_check=HttpHealthCheck(url="http://127.0.0.1:8006/health"),
     depends_on=["postgres", "redis"],
 )
 
 stack.service(
     name="gateway",
     path="./gateway",
-    command="python -m uvicorn main:app --reload --host 0.0.0.0 --port 8001",
-    port=8001,
-    health_check=HttpHealthCheck(url="http://127.0.0.1:8001/health"),
+    command="python -m uvicorn main:app --reload --host 0.0.0.0 --port 8007",
+    port=8007,
+    health_check=HttpHealthCheck(url="http://127.0.0.1:8007/health"),
     depends_on=["auth"],
 )
 

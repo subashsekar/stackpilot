@@ -155,32 +155,68 @@ class TestStatusFormatting:
             ],
         )
         assert "Project: demo" in text
-        assert "Running services: 1" in text
-        assert "Healthy services: 1" in text
+        assert "Running: 1" in text
+        assert "Healthy: 1" in text
         assert "Applications" in text
         assert "SERVICE" in text
         assert "STATUS" in text
-        # Column order: Service | Status | PID | Port | Uptime | Framework
+        # Column order: Service | Status | PID | Port | Uptime | Health | Framework | Language
         header = next(line for line in text.splitlines() if line.startswith("SERVICE"))
         assert header.index("STATUS") < header.index("PID")
         assert header.index("PID") < header.index("PORT")
         assert header.index("PORT") < header.index("UPTIME")
-        assert header.index("UPTIME") < header.index("FRAMEWORK")
+        assert header.index("UPTIME") < header.index("HEALTH")
+        assert header.index("HEALTH") < header.index("FRAMEWORK")
+        assert header.index("FRAMEWORK") < header.index("LANGUAGE")
         assert "auth" in text
         assert "uvicorn" in text
         assert "8001" in text
+        assert "healthy" in text
+        assert "Python" in text
         assert format_uptime(65) == "1m05s"
 
     def test_ps_only_active(self) -> None:
         text = format_ps_table(
             [
-                {"name": "auth", "pid": 1, "port": 8001, "status": "running"},
+                {
+                    "name": "auth",
+                    "pid": 1,
+                    "port": 8001,
+                    "status": "running",
+                    "framework": "express",
+                    "language": "JavaScript",
+                    "health": "healthy",
+                    "command": "npm start",
+                },
                 {"name": "dead", "pid": None, "port": 9, "status": "stopped"},
             ]
         )
         assert "auth" in text
         assert "dead" not in text
         assert "PID" in text
+        assert "FRAMEWORK" in text
+        assert "LANGUAGE" in text
+        assert "express" in text
+        assert "JavaScript" in text
+        assert "HEALTH" in text
+
+
+class TestDetectFrameworkNode:
+    def test_node_commands_never_dash(self) -> None:
+        assert detect_framework("npm start") == "node"
+        assert detect_framework("node server.js") == "node"
+        assert detect_framework("npx nest start") == "nestjs"
+        assert detect_framework("node express-app.js") == "express"
+        assert detect_framework("") == "-"
+
+    def test_language_for_frameworks(self) -> None:
+        from stackpilot.status import detect_language
+
+        assert detect_language("uvicorn app:app", framework="uvicorn") == "Python"
+        assert detect_language("flask run", framework="flask") == "Python"
+        assert detect_language("python manage.py runserver", framework="django") == "Python"
+        assert detect_language("npm start", framework="express") == "JavaScript"
+        assert detect_language("npx nest start", framework="nestjs") == "TypeScript"
 
 
 class TestCliStatusPsLogs:
@@ -206,9 +242,9 @@ class TestCliStatusPsLogs:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0
-        assert "Running services: 1" in result.output
-        assert "Healthy services: 1" in result.output
-        assert "Failed services: 1" in result.output
+        assert "Running: 1" in result.output
+        assert "Healthy: 1" in result.output
+        assert "Failed: 1" in result.output
         assert "uvicorn" in result.output
         assert "failed" in result.output
 

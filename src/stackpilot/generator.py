@@ -209,6 +209,8 @@ def generate_stackfile(
         "postgres": "postgres",
         "postgresql": "postgres",
         "db": "postgres",
+        "mongodb": "mongodb",
+        "mongo": "mongodb",
         "rabbitmq": "rabbitmq",
         "amqp": "rabbitmq",
     }

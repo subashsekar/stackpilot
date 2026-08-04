@@ -345,6 +345,8 @@ class ProcessManager:
             cwd,
             services=self._topology_services,
             external_dependencies=self._external_dependencies,
+            env=spec.env,
+            env_file=spec.env_file,
         )
         argv = resolve_service_argv(spec.command, cwd=cwd, env=env)
 

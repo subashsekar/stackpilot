@@ -15,13 +15,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import ManagedService, ServiceState, configured_port
 from .port_detect import listening_ports_for_pid, parse_port_from_command
+from .dashboard import color_enabled, style_text
 
 __all__ = [
     "ServiceRuntimeInfo",
     "RuntimeStatus",
     "RUNTIME_STATUS_FILE",
     "RUNTIME_FLUSH_INTERVAL_S",
+    "STATUS_PROBE_TIMEOUT_S",
+    "STATUS_PROBE_CACHE_TTL_S",
     "detect_framework",
+    "detect_language",
     "derive_health",
     "format_uptime",
     "load_runtime_snapshot",
@@ -30,6 +34,7 @@ __all__ = [
     "format_status_report",
     "format_ps_table",
     "pid_is_alive",
+    "probe_external_dependencies_status",
 ]
 
 RUNTIME_STATUS_FILE = Path(".stackpilot") / "runtime.json"
@@ -38,6 +43,13 @@ RUNTIME_STATUS_FILE = Path(".stackpilot") / "runtime.json"
 # Meaningful field changes (state / PID / status / port / issue count) write
 # immediately; idle monitor polls must not hammer the disk every ~250 ms.
 RUNTIME_FLUSH_INTERVAL_S = 1.5
+
+# External dependency probes for ``stackpilot status`` (never block the table).
+STATUS_PROBE_TIMEOUT_S = 0.25
+STATUS_PROBE_CACHE_TTL_S = 5.0
+
+_probe_cache: Dict[str, tuple[float, str]] = {}
+_probe_cache_lock = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +64,7 @@ class ServiceRuntimeInfo:
     uptime: Optional[float]
     exit_code: Optional[int] = None
     framework: str = "-"
+    language: str = "-"
     command: str = ""
     health: str = "stopped"
 
@@ -138,6 +151,7 @@ class RuntimeStatus:
                         uptime=None,
                         exit_code=info.exit_code,
                         framework=info.framework,
+                        language=info.language,
                         command=info.command,
                         health=derive_health(ServiceState.STOPPED),
                     )
@@ -153,11 +167,13 @@ class RuntimeStatus:
         port: Optional[int] = None,
         status: ServiceState = ServiceState.STOPPED,
         framework: str = "-",
+        language: str = "-",
         command: str = "",
     ) -> None:
         with self._lock:
             if name not in self._by_name:
                 self._order.append(name)
+                fw = framework or "-"
                 self._by_name[name] = ServiceRuntimeInfo(
                     name=name,
                     pid=None,
@@ -165,13 +181,15 @@ class RuntimeStatus:
                     port=port,
                     started_at=None,
                     uptime=None,
-                    framework=framework or "-",
+                    framework=fw,
+                    language=language or detect_language(command, framework=fw),
                     command=command or "",
                     health=derive_health(status),
                 )
             else:
                 prev = self._by_name[name]
                 new_status = prev.status
+                fw = framework or prev.framework
                 self._by_name[name] = ServiceRuntimeInfo(
                     name=prev.name,
                     pid=prev.pid,
@@ -180,7 +198,10 @@ class RuntimeStatus:
                     started_at=prev.started_at,
                     uptime=prev.uptime,
                     exit_code=prev.exit_code,
-                    framework=framework or prev.framework,
+                    framework=fw,
+                    language=language
+                    or prev.language
+                    or detect_language(command or prev.command, framework=fw),
                     command=command or prev.command,
                     health=derive_health(new_status),
                 )
@@ -188,15 +209,19 @@ class RuntimeStatus:
     def register_specs(self, specs: Iterable) -> None:
         for spec in specs:
             cmd = str(getattr(spec, "command", "") or "")
+            path = getattr(spec, "path", None)
+            fw = detect_framework(cmd, path=path)
             self.register(
                 spec.name,
                 port=configured_port(spec),
-                framework=detect_framework(cmd),
+                framework=fw,
+                language=detect_language(cmd, framework=fw),
                 command=cmd,
             )
 
     def sync_managed(self, managed: ManagedService) -> None:
         cmd = str(managed.spec.command or "")
+        fw = detect_framework(cmd, path=managed.spec.path)
         info = ServiceRuntimeInfo(
             name=managed.name,
             pid=managed.pid,
@@ -205,7 +230,8 @@ class RuntimeStatus:
             started_at=managed.started_at,
             uptime=managed.uptime,
             exit_code=managed.exit_code,
-            framework=detect_framework(cmd),
+            framework=fw,
+            language=detect_language(cmd, framework=fw),
             command=cmd,
             health=derive_health(managed.status),
         )
@@ -220,6 +246,7 @@ class RuntimeStatus:
         synced: List[ServiceRuntimeInfo] = []
         for managed in services:
             cmd = str(managed.spec.command or "")
+            fw = detect_framework(cmd, path=managed.spec.path)
             info = ServiceRuntimeInfo(
                 name=managed.name,
                 pid=managed.pid,
@@ -228,7 +255,8 @@ class RuntimeStatus:
                 started_at=managed.started_at,
                 uptime=managed.uptime,
                 exit_code=managed.exit_code,
-                framework=detect_framework(cmd),
+                framework=fw,
+                language=detect_language(cmd, framework=fw),
                 command=cmd,
                 health=derive_health(managed.status),
             )
@@ -390,14 +418,17 @@ def load_runtime_snapshot(project_root: Path) -> Optional[Dict[str, Any]]:
                     any_alive = True
                     started = raw.get("started_at")
                     raw["uptime"] = _uptime_from_iso(started)
-                    # Prefer the process's actual listen port when available.
-                    live = listening_ports_for_pid(pid)
-                    if live:
-                        raw["port"] = live[0]
-                    elif raw.get("port") is None:
-                        raw["port"] = parse_port_from_command(
-                            str(raw.get("command") or "")
-                        )
+                    # Prefer the process's actual listen port when missing.
+                    # Skip the subprocess probe when a port is already known —
+                    # status/ps merge would otherwise double the cost.
+                    if raw.get("port") is None:
+                        live = listening_ports_for_pid(pid)
+                        if live:
+                            raw["port"] = live[0]
+                        else:
+                            raw["port"] = parse_port_from_command(
+                                str(raw.get("command") or "")
+                            )
                 else:
                     raw["status"] = ServiceState.STOPPED.value
                     raw["pid"] = None
@@ -449,7 +480,19 @@ def derive_health(status: ServiceState | str) -> str:
     return "stopped"
 
 
-def detect_framework(command: str | Sequence[str]) -> str:
+def detect_framework(
+    command: str | Sequence[str],
+    *,
+    path: Optional[Path | str] = None,
+) -> str:
+    """
+    Detect a runtime framework label from a launch command.
+
+    Node launchers (``npm``, ``node``, ``pnpm``, …) never return ``"-"`` —
+    they resolve to ``express`` / ``nestjs`` / ``node``. Optional ``path``
+    enables adapter-based NestJS vs Express disambiguation.
+    """
+
     if isinstance(command, (list, tuple)):
         tokens = [str(p).lower() for p in command]
         text = " ".join(tokens)
@@ -468,11 +511,89 @@ def detect_framework(command: str | Sequence[str]) -> str:
         return "flask"
     if "django" in text or "manage.py" in text:
         return "django"
+    if "celery" in text:
+        return "celery"
+    if "nest" in text:
+        return "nestjs"
+    if "express" in text:
+        return "express"
+    if any(
+        token in text
+        for token in ("npm", "npx", "node", "pnpm", "yarn", "bun")
+    ):
+        label = _adapter_framework_from_path(path)
+        if label in {"nestjs", "express"}:
+            return label
+        return "node"
     if tokens and Path(tokens[0]).name.startswith("python"):
         return "python"
     if "python" in tokens:
         return "python"
     return "-"
+
+
+def detect_language(
+    command: str | Sequence[str],
+    *,
+    framework: str = "",
+) -> str:
+    """Map a command / framework to a language label for status / ps / graph."""
+
+    fw = (framework or detect_framework(command)).strip().lower()
+    if fw in {
+        "fastapi",
+        "flask",
+        "django",
+        "uvicorn",
+        "gunicorn",
+        "celery",
+        "python",
+    }:
+        return "Python"
+    if fw == "nestjs":
+        return "TypeScript"
+    if fw in {"express", "node"}:
+        return "JavaScript"
+
+    if isinstance(command, (list, tuple)):
+        text = " ".join(str(p).lower() for p in command)
+    else:
+        text = str(command or "").strip().lower()
+    if not text:
+        return "-"
+    if any(
+        token in text
+        for token in ("uvicorn", "gunicorn", "fastapi", "flask", "django", "python")
+    ):
+        return "Python"
+    if any(
+        token in text
+        for token in ("npm", "npx", "node", "pnpm", "yarn", "bun", "express", "nest")
+    ):
+        return "JavaScript"
+    return "-"
+
+
+def _adapter_framework_from_path(path: Optional[Path | str]) -> str:
+    """Best-effort NestJS/Express label from a service directory."""
+
+    if path is None or path == "":
+        return ""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return ""
+    if not resolved.is_dir():
+        return ""
+    try:
+        from .adapters import default_registry
+
+        adapter = default_registry.match(resolved)
+        if adapter is None or getattr(adapter, "external", False):
+            return ""
+        return str(adapter.name or "").strip().lower()
+    except Exception:
+        return ""
 
 
 def format_uptime(seconds: Optional[float]) -> str:
@@ -494,7 +615,9 @@ def format_status_report(
     services: Sequence[Dict[str, Any]],
     session_active: bool,
     external_dependencies: Sequence[Dict[str, Any]] | None = None,
+    color: bool | None = None,
 ) -> str:
+    use_color = color_enabled(force=color)
     running = sum(1 for s in services if s.get("status") == ServiceState.RUNNING.value)
     failed = sum(1 for s in services if s.get("status") == ServiceState.FAILED.value)
     healthy = sum(
@@ -506,9 +629,7 @@ def format_status_report(
 
     lines = [
         f"Project: {project_name}",
-        f"Running services: {running}",
-        f"Healthy services: {healthy}",
-        f"Failed services: {failed}",
+        f"Running: {running}  Healthy: {healthy}  Failed: {failed}",
         "",
     ]
     if not session_active and running == 0:
@@ -517,18 +638,39 @@ def format_status_report(
         lines.append("")
 
     lines.append("Applications")
-    lines.append("")
-    headers = ("SERVICE", "STATUS", "PID", "PORT", "UPTIME", "FRAMEWORK")
+    lines.append("-" * 12)
+    headers = (
+        "SERVICE",
+        "STATUS",
+        "PID",
+        "PORT",
+        "UPTIME",
+        "HEALTH",
+        "FRAMEWORK",
+        "LANGUAGE",
+    )
     rows: List[tuple[str, ...]] = []
     for svc in services:
+        status = str(svc.get("status") or "-")
+        framework = str(svc.get("framework") or "-")
+        language = str(
+            svc.get("language")
+            or detect_language(str(svc.get("command") or ""), framework=framework)
+            or "-"
+        )
+        health = str(
+            svc.get("health") or derive_health(status) or "-"
+        )
         rows.append(
             (
                 str(svc.get("name") or "-"),
-                str(svc.get("status") or "-"),
+                _colorize_status_label(status, use_color=use_color),
                 "-" if svc.get("pid") is None else str(svc.get("pid")),
                 "-" if svc.get("port") is None else str(svc.get("port")),
                 format_uptime(svc.get("uptime")),
-                str(svc.get("framework") or "-"),
+                _colorize_health_label(health, use_color=use_color),
+                framework,
+                language,
             )
         )
     lines.append(_format_table(headers, rows))
@@ -537,17 +679,18 @@ def format_status_report(
     if externals:
         lines.append("")
         lines.append("External Dependencies")
-        lines.append("")
+        lines.append("-" * 21)
         ext_headers = ("NAME", "TYPE", "HOST", "PORT", "STATUS")
         ext_rows: List[tuple[str, ...]] = []
         for dep in externals:
+            ext_status = str(dep.get("status") or "-")
             ext_rows.append(
                 (
                     str(dep.get("name") or "-"),
                     str(dep.get("type") or "-"),
                     str(dep.get("host") or "-"),
                     "-" if dep.get("port") is None else str(dep.get("port")),
-                    str(dep.get("status") or "-"),
+                    _colorize_external_status(ext_status, use_color=use_color),
                 )
             )
         lines.append(_format_table(ext_headers, ext_rows))
@@ -555,7 +698,12 @@ def format_status_report(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def format_ps_table(services: Sequence[Dict[str, Any]]) -> str:
+def format_ps_table(
+    services: Sequence[Dict[str, Any]],
+    *,
+    color: bool | None = None,
+) -> str:
+    use_color = color_enabled(force=color)
     active = [
         s
         for s in services
@@ -563,17 +711,156 @@ def format_ps_table(services: Sequence[Dict[str, Any]]) -> str:
     ]
     if not active:
         return "No active StackPilot processes.\n"
-    headers = ("SERVICE", "PID", "PORT", "STATUS")
-    rows = [
-        (
-            str(s.get("name") or "-"),
-            str(s.get("pid")),
-            "-" if s.get("port") is None else str(s.get("port")),
-            str(s.get("status") or "-"),
+    headers = (
+        "SERVICE",
+        "PID",
+        "PORT",
+        "STATUS",
+        "HEALTH",
+        "FRAMEWORK",
+        "LANGUAGE",
+    )
+    rows = []
+    for s in active:
+        framework = str(s.get("framework") or "-")
+        language = str(
+            s.get("language")
+            or detect_language(str(s.get("command") or ""), framework=framework)
+            or "-"
         )
-        for s in active
-    ]
+        status = str(s.get("status") or "-")
+        health = str(s.get("health") or derive_health(status) or "-")
+        rows.append(
+            (
+                str(s.get("name") or "-"),
+                str(s.get("pid")),
+                "-" if s.get("port") is None else str(s.get("port")),
+                _colorize_status_label(status, use_color=use_color),
+                _colorize_health_label(health, use_color=use_color),
+                framework,
+                language,
+            )
+        )
     return _format_table(headers, rows) + "\n"
+
+
+def probe_external_dependencies_status(
+    deps: Sequence[Any],
+    *,
+    timeout_s: float = STATUS_PROBE_TIMEOUT_S,
+    cache_ttl_s: float = STATUS_PROBE_CACHE_TTL_S,
+) -> List[Dict[str, Any]]:
+    """
+    Probe external dependencies in parallel for ``stackpilot status``.
+
+    Short timeouts + a small TTL cache keep status under ~1s even when one
+    Redis/Postgres endpoint is down. Cached misses are labeled ``stale``.
+    """
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    deps_list = list(deps)
+    if not deps_list:
+        return []
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _one(dep: Any) -> Dict[str, Any]:
+        key = f"{getattr(dep, 'name', '')}|{getattr(dep, 'host', '')}|{getattr(dep, 'port', '')}"
+        now = time.monotonic()
+        with _probe_cache_lock:
+            cached = _probe_cache.get(key)
+        try:
+            ok = _quick_external_probe(dep, timeout_s=timeout_s)
+            status = "reachable" if ok else "unreachable"
+            with _probe_cache_lock:
+                _probe_cache[key] = (now, status)
+            return {
+                "name": getattr(dep, "name", "-"),
+                "type": getattr(dep, "type", "-"),
+                "host": getattr(dep, "host", "-"),
+                "port": getattr(dep, "port", None),
+                "status": status,
+            }
+        except Exception:
+            if cached is not None and (now - cached[0]) <= cache_ttl_s * 4:
+                return {
+                    "name": getattr(dep, "name", "-"),
+                    "type": getattr(dep, "type", "-"),
+                    "host": getattr(dep, "host", "-"),
+                    "port": getattr(dep, "port", None),
+                    "status": f"{cached[1]} (stale)",
+                }
+            return {
+                "name": getattr(dep, "name", "-"),
+                "type": getattr(dep, "type", "-"),
+                "host": getattr(dep, "host", "-"),
+                "port": getattr(dep, "port", None),
+                "status": "unreachable",
+            }
+
+    # Serve fresh cache hits without spawning workers.
+    pending: list[Any] = []
+    now = time.monotonic()
+    for dep in deps_list:
+        key = f"{getattr(dep, 'name', '')}|{getattr(dep, 'host', '')}|{getattr(dep, 'port', '')}"
+        with _probe_cache_lock:
+            cached = _probe_cache.get(key)
+        if cached is not None and (now - cached[0]) <= cache_ttl_s:
+            results[getattr(dep, "name", key)] = {
+                "name": getattr(dep, "name", "-"),
+                "type": getattr(dep, "type", "-"),
+                "host": getattr(dep, "host", "-"),
+                "port": getattr(dep, "port", None),
+                "status": cached[1],
+            }
+        else:
+            pending.append(dep)
+
+    if pending:
+        workers = min(len(pending), 32)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_one, dep): dep for dep in pending}
+            for future in as_completed(futures):
+                row = future.result()
+                results[str(row.get("name") or "")] = row
+
+    ordered: List[Dict[str, Any]] = []
+    for dep in deps_list:
+        name = getattr(dep, "name", "")
+        ordered.append(
+            results.get(
+                name,
+                {
+                    "name": name,
+                    "type": getattr(dep, "type", "-"),
+                    "host": getattr(dep, "host", "-"),
+                    "port": getattr(dep, "port", None),
+                    "status": "unreachable",
+                },
+            )
+        )
+    return ordered
+
+
+def _quick_external_probe(dep: Any, *, timeout_s: float) -> bool:
+    """Single short TCP/HTTP probe for status (never uses full startup retries)."""
+
+    from .config import HttpHealthCheck, TcpHealthCheck
+    from .http_checker import check_http
+    from .tcp_checker import check_tcp
+
+    check = getattr(dep, "health_check", None)
+    if isinstance(check, HttpHealthCheck) and check.url:
+        return bool(check_http(check.url, request_timeout=timeout_s))
+    host = getattr(dep, "host", "127.0.0.1")
+    port = getattr(dep, "port", None)
+    if isinstance(check, TcpHealthCheck):
+        host = check.host or host
+        port = check.port if check.port is not None else port
+    if port is None:
+        return False
+    return check_tcp(str(host), int(port), connect_timeout=timeout_s)
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -623,14 +910,71 @@ def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+            widths[i] = max(widths[i], _visible_width(cell))
     head = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
     sep = "  ".join("-" * widths[i] for i in range(len(headers)))
     body = [
-        "  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row))
+        "  ".join(_pad_visible(str(cell), widths[i]) for i, cell in enumerate(row))
         for row in rows
     ]
     return "\n".join([head, sep, *body]) if body else "\n".join([head, sep])
+
+
+_ANSI_RE = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_width(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    pad = max(0, width - _visible_width(text))
+    return text + (" " * pad)
+
+
+def _colorize_status_label(status: str, *, use_color: bool) -> str:
+    if not use_color:
+        return status
+    key = status.strip().lower()
+    if key in {ServiceState.RUNNING.value, "reloading", "reload"}:
+        return style_text(status, fg="green")
+    if key == ServiceState.STARTING.value or key == "restarting":
+        return style_text(status, fg="yellow")
+    if key == ServiceState.FAILED.value:
+        return style_text(status, fg="red")
+    if key == ServiceState.STOPPED.value:
+        return style_text(status, fg="bright_black")
+    if key in {"external", "reachable"}:
+        return style_text(status, fg="cyan")
+    return status
+
+
+def _colorize_health_label(health: str, *, use_color: bool) -> str:
+    if not use_color:
+        return health
+    key = health.strip().lower()
+    if key == "healthy":
+        return style_text(health, fg="green")
+    if key in {"unhealthy", "failed"}:
+        return style_text(health, fg="red")
+    if key in {"warning", "starting", "degraded"}:
+        return style_text(health, fg="yellow")
+    if key == "stopped":
+        return style_text(health, fg="bright_black")
+    return health
+
+
+def _colorize_external_status(status: str, *, use_color: bool) -> str:
+    if not use_color:
+        return status
+    key = status.strip().lower()
+    if key.startswith("reachable"):
+        return style_text(status, fg="cyan")
+    if "stale" in key:
+        return style_text(status, fg="yellow")
+    if key.startswith("unreachable"):
+        return style_text(status, fg="red")
+    return style_text(status, fg="cyan")
 
 
 def _service_to_dict(info: ServiceRuntimeInfo) -> Dict[str, Any]:
@@ -646,6 +990,7 @@ def _service_to_dict(info: ServiceRuntimeInfo) -> Dict[str, Any]:
         "uptime": info.uptime,
         "exit_code": info.exit_code,
         "framework": info.framework,
+        "language": info.language or detect_language(info.command, framework=info.framework),
         "command": info.command,
         "health": info.health or derive_health(status),
     }

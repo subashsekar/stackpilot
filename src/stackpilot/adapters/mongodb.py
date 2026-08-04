@@ -55,11 +55,9 @@ class MongoDBAdapter(FrameworkAdapter):
             if _env_mentions_mongo(directory):
                 return True
 
-        # Standalone compose/env at this directory without a mongo-named folder
-        # still counts when image/service keys are explicit.
-        if _env_mentions_mongo(directory) and (
-            text or (directory / "mongod.conf").is_file()
-        ):
+        # Explicit mongodb:// in a non-app directory (no framework entrypoint)
+        # is enough. Soft "mongodb" text next to an unrelated compose file is not.
+        if _env_has_mongo_uri(directory) and not _looks_like_application(directory):
             return True
 
         return False
@@ -90,35 +88,44 @@ class MongoDBAdapter(FrameworkAdapter):
 def _compose_looks_like_mongo(text: str) -> bool:
     """True for explicit MongoDB compose image/service keys (no soft guesses)."""
 
-    markers = (
-        "image: mongo",
-        "image:mongo",
-        "image: mongodb",
-        "image:mongodb",
-        "mongo:",
-        "mongodb:",
-        "mongod",
-    )
-    if any(marker in text for marker in markers):
-        # Avoid matching unrelated "mongo" substrings inside app names by
-        # requiring a compose image/service style token already checked above,
-        # or an explicit URI / port 27017 binding.
-        if "27017" in text:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("image:") and _compose_image_is_mongo(stripped):
             return True
-        if any(uri in text for uri in _MONGO_URI_MARKERS):
+        # YAML service keys ``mongo:`` / ``mongodb:`` (not image tags).
+        if stripped.startswith("mongo:") or stripped.startswith("mongodb:"):
             return True
-        if "image: mongo" in text or "image:mongo" in text:
-            return True
-        if "image: mongodb" in text or "image:mongodb" in text:
-            return True
-        # ``mongo:`` / ``mongodb:`` service keys (YAML mapping).
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("mongo:") or stripped.startswith("mongodb:"):
-                return True
-            if stripped.startswith("image:") and "mongo" in stripped:
-                return True
+
+    if any(uri in text for uri in _MONGO_URI_MARKERS):
+        return True
+
+    # Port + explicit mongo token reinforces shared compose layouts.
+    if "27017" in text and ("mongodb" in text or "mongod" in text):
+        return True
+
     return False
+
+
+def _compose_image_is_mongo(image_line: str) -> bool:
+    """
+    True for official / common MongoDB images.
+
+    Matches ``mongo``, ``mongodb``, ``library/mongo``, ``bitnami/mongodb``,
+    and tagged variants. Rejects incidental names like ``mongolian-api``.
+    """
+
+    # ``image: bitnami/mongodb:6.0`` → ``bitnami/mongodb:6.0``
+    _, _, rest = image_line.partition(":")
+    image = rest.strip().strip("\"'")
+    if not image:
+        return False
+    # Drop registry host if present (``docker.io/library/mongo:6``).
+    path = image
+    if "/" in image and ("." in image.split("/", 1)[0] or ":" in image.split("/", 1)[0]):
+        path = image.split("/", 1)[1]
+    # Final path segment without tag.
+    name = path.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
+    return name in {"mongo", "mongodb"}
 
 
 def _env_mentions_mongo(directory: Path) -> bool:
@@ -130,5 +137,38 @@ def _env_mentions_mongo(directory: Path) -> bool:
         if any(uri in text for uri in _MONGO_URI_MARKERS):
             return True
         if "mongod" in text or "mongodb" in text:
+            return True
+    return False
+
+
+def _env_has_mongo_uri(directory: Path) -> bool:
+    """True only for explicit ``mongodb://`` / ``mongodb+srv://`` connection strings."""
+
+    for name in (".env", ".env.local", ".env.development", ".env.dev"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        text = read_text(path).lower()
+        if any(uri in text for uri in _MONGO_URI_MARKERS):
+            return True
+    return False
+
+
+def _looks_like_application(directory: Path) -> bool:
+    """True when the directory has a typical application entrypoint."""
+
+    for relative in (
+        "main.py",
+        "app.py",
+        "wsgi.py",
+        "asgi.py",
+        "manage.py",
+        "server.py",
+        "application.py",
+        "package.json",
+        "go.mod",
+        "Cargo.toml",
+    ):
+        if (directory / relative).is_file():
             return True
     return False

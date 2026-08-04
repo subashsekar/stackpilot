@@ -6,9 +6,9 @@ stack.service(
     name="app",
     path="./app",
     command="npm run dev",
-    port=8000,
+    port=8004,
     reload=True,
-    health_check=HttpHealthCheck(url="http://127.0.0.1:8000/"),
+    health_check=HttpHealthCheck(url="http://127.0.0.1:8004/"),
 )
 
 stack.run()

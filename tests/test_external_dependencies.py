@@ -114,7 +114,12 @@ class TestDependencyGraphExternals:
         assert "PostgreSQL" in tree or "postgres" in tree
         assert "Redis" in tree or "redis" in tree
         assert "auth" in tree
-        assert "├──" in tree or "└──" in tree or "[external]" in tree
+        assert (
+            "├──" in tree
+            or "└──" in tree
+            or "[external]" in tree
+            or "External Infrastructure" in tree
+        )
 
     def test_cannot_start_external_as_target(self) -> None:
         graph = DependencyGraph.from_services(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .base import (
@@ -56,6 +57,10 @@ class NestJSAdapter(FrameworkAdapter):
             }
 
         health_path = discover_health_path(directory, self.name)
+        # NestJS root ``@Get()`` → ``/`` is a business route, not a health
+        # endpoint. Only /health-like paths (or Terminus) count as HTTP health.
+        if health_path == "/":
+            health_path = None
         if health_path is None:
             health_path = _nestjs_fallback_health_path(directory)
         preferred = detect_preferred_port(directory)
@@ -87,13 +92,19 @@ def _nestjs_fallback_health_path(directory: Path) -> str | None:
         if not text:
             continue
         lower = text.lower()
+        compact = lower.replace(" ", "")
         if "@healthcheck" in lower or "healthcheckservice" in lower:
             return "/health"
-        if "healthcontroller" in lower.replace(" ", ""):
+        if "healthcheckcontroller" in compact or "healthcontroller" in compact:
+            return "/health"
+        if "from '@nestjs/terminus'" in lower or 'from "@nestjs/terminus"' in lower:
             return "/health"
         if "@controller('health')" in lower or '@controller("health")' in lower:
             return "/health"
         if "@controller" in lower and "path:" in lower and "health" in lower:
+            return "/health"
+        # ``@Get('health')`` / ``@Get("/health")`` on any controller.
+        if re.search(r"""@get\s*\(\s*['\"]/?health['\"]""", lower):
             return "/health"
     return None
 

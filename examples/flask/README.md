@@ -25,7 +25,7 @@ cd examples/flask
 stackpilot run
 ```
 
-Health: `http://127.0.0.1:8000/`
+Health: `http://127.0.0.1:8002/`
 
 ## Re-sync
 
