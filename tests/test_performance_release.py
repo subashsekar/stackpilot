@@ -82,18 +82,24 @@ class TestPerformanceBudgets:
             ordered=ordered,
             logger=logger,
         )
-        t0 = time.perf_counter()
-        assert runner.start_all(ordered)
-        startup = time.perf_counter() - t0
-        t1 = time.perf_counter()
-        code = runner.shutdown(logger)
-        shutdown = time.perf_counter() - t1
-        watch.stop()
-        runner.unbind()
-        logger.close()
-        assert code == 130
-        assert startup < 10.0
-        assert shutdown < 15.0
+        try:
+            t0 = time.perf_counter()
+            assert runner.start_all(ordered)
+            startup = time.perf_counter() - t0
+            t1 = time.perf_counter()
+            code = runner.shutdown(logger)
+            shutdown = time.perf_counter() - t1
+            assert code == 130
+            assert startup < 10.0
+            assert shutdown < 15.0
+        finally:
+            try:
+                manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
+            watch.stop()
+            runner.unbind()
+            logger.close()
 
     def test_reload_stress_no_double_reload(self, tmp_path: Path) -> None:
         logger = Logger(tmp_path / "issues", service_names=["demo"], auto_cleanup=False)
@@ -116,7 +122,6 @@ class TestPerformanceBudgets:
         )
         manager.start(spec)
         restarts = {"n": 0}
-        original = runner._restart_with_health
 
         def counting(manager_, spec_):  # noqa: ANN001
             restarts["n"] += 1
@@ -128,18 +133,24 @@ class TestPerformanceBudgets:
             threading.Thread(target=runner.on_reload, args=("demo", ["a.py"]))
             for _ in range(8)
         ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-        # Overlapping reloads for the same service are coalesced to one in-flight
-        # restart plus at most one follow-up (never one-per-event).
-        assert 1 <= restarts["n"] <= 2
-        runner.begin_shutdown()
-        runner.shutdown(logger)
-        watch.stop()
-        runner.unbind()
-        logger.close()
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            # Overlapping reloads for the same service are coalesced to one in-flight
+            # restart plus at most one follow-up (never one-per-event).
+            assert 1 <= restarts["n"] <= 2
+            runner.begin_shutdown()
+            runner.shutdown(logger)
+        finally:
+            try:
+                manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
+            watch.stop()
+            runner.unbind()
+            logger.close()
 
 
 class TestLeakDetection:
@@ -159,11 +170,17 @@ class TestLeakDetection:
             logger=logger,
         )
         manager.start(spec)
-        time.sleep(0.2)
-        runner.shutdown(logger)
-        watch.stop()
-        runner.unbind()
-        logger.close()
+        try:
+            time.sleep(0.2)
+            runner.shutdown(logger)
+        finally:
+            try:
+                manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
+            watch.stop()
+            runner.unbind()
+            logger.close()
         time.sleep(0.3)
         after = {t.name for t in threading.enumerate()}
         leaked = [
@@ -190,10 +207,16 @@ class TestLeakDetection:
         managed = manager.start(spec)
         pid = managed.pid
         assert pid is not None
-        runner.shutdown(logger)
-        watch.stop()
-        runner.unbind()
-        logger.close()
+        try:
+            runner.shutdown(logger)
+        finally:
+            try:
+                manager.stop_all(timeout_s=0.1)
+            except Exception:
+                pass
+            watch.stop()
+            runner.unbind()
+            logger.close()
         time.sleep(0.2)
         alive = True
         try:
@@ -231,8 +254,10 @@ class TestLeakDetection:
             reload=True,
         )
         watch.start([spec], on_change, project_root=tmp_path)
-        assert watch.watched_services
-        watch.stop()
+        try:
+            assert watch.watched_services
+        finally:
+            watch.stop()
         assert list(watch.watched_services) == []
         # Post-stop notifications must not be delivered via manager callback list.
         assert watch._on_change is None

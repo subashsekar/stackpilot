@@ -316,12 +316,14 @@ def test_watch_manager_skips_native_reload(tmp_path: Path) -> None:
         )
     ]
     wm = WatchManager(debounce_s=0.05, log=logs.append)
-    wm.start(specs, lambda name, paths: called.append(name), project_root=tmp_path)
+    try:
+        wm.start(specs, lambda name, paths: called.append(name), project_root=tmp_path)
 
-    assert wm.watched_services == ()
-    assert any("Native reload enabled" in line for line in logs)
-    assert called == []
-    wm.stop()
+        assert wm.watched_services == ()
+        assert any("Native reload enabled" in line for line in logs)
+        assert called == []
+    finally:
+        wm.stop()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows reload takeover only")
@@ -336,11 +338,13 @@ def test_watch_manager_windows_takeover_uvicorn_reload(tmp_path: Path) -> None:
         )
     ]
     wm = WatchManager(debounce_s=0.05, log=logs.append)
-    wm.start(specs, lambda _name, _paths: None, project_root=tmp_path)
+    try:
+        wm.start(specs, lambda _name, _paths: None, project_root=tmp_path)
 
-    assert list(wm.watched_services) == ["ai_service"]
-    assert any("StackPilot reload enabled" in line for line in logs)
-    wm.stop()
+        assert list(wm.watched_services) == ["ai_service"]
+        assert any("StackPilot reload enabled" in line for line in logs)
+    finally:
+        wm.stop()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows reload takeover only")
@@ -380,10 +384,12 @@ def test_watch_manager_takes_over_django_runserver_without_reload_flag(
             reload=False,
         ),
     ]
-    wm.start(specs, lambda *_: None, project_root=tmp_path)
-    assert list(wm.watched_services) == ["gateway"]
-    assert any("StackPilot reload enabled" in line for line in logs)
-    wm.stop()
+    try:
+        wm.start(specs, lambda *_: None, project_root=tmp_path)
+        assert list(wm.watched_services) == ["gateway"]
+        assert any("StackPilot reload enabled" in line for line in logs)
+    finally:
+        wm.stop()
 
 
 def test_watch_manager_starts_watcher_for_reload_true(tmp_path: Path) -> None:
@@ -409,18 +415,20 @@ def test_watch_manager_starts_watcher_for_reload_true(tmp_path: Path) -> None:
         ),
     ]
     wm = WatchManager(debounce_s=0.05, log=lambda _m: None)
-    wm.start(specs, on_change, project_root=tmp_path)
+    try:
+        wm.start(specs, on_change, project_root=tmp_path)
 
-    assert list(wm.watched_services) == ["api"]
-    watcher = wm.get_watcher("api")
-    assert watcher is not None
-    path = tmp_path / "x.py"
-    path.write_text("x", encoding="utf-8")
-    watcher.notify_for_tests(path)
+        assert list(wm.watched_services) == ["api"]
+        watcher = wm.get_watcher("api")
+        assert watcher is not None
+        path = tmp_path / "x.py"
+        path.write_text("x", encoding="utf-8")
+        watcher.notify_for_tests(path)
 
-    assert done.wait(timeout=2.0)
-    assert events == ["api"]
-    wm.stop()
+        assert done.wait(timeout=2.0)
+        assert events == ["api"]
+    finally:
+        wm.stop()
 
 
 def test_resolve_reload_dirs_defaults_to_service_path(tmp_path: Path) -> None:

@@ -185,9 +185,23 @@ class TestFullLifecycle:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        raised.wait(timeout=15.0)
-        thread.join(timeout=10.0)
-        assert raised.is_set()
+        try:
+            raised.wait(timeout=15.0)
+            thread.join(timeout=10.0)
+            assert raised.is_set()
+        finally:
+            try:
+                orch.stop()
+            except Exception:
+                pass
+            if thread.is_alive():
+                thread.join(timeout=5.0)
+            runner_obj = orch._runner
+            if runner_obj is not None and runner_obj._manager is not None:
+                try:
+                    runner_obj._manager.stop_all(timeout_s=0.1)
+                except Exception:
+                    pass
 
     def test_external_dependency_gate(self, tmp_path: Path) -> None:
         port = _free_port()

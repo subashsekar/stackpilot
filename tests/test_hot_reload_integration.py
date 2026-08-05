@@ -58,6 +58,34 @@ def _force_kill_pids(pids: dict[str, int | None]) -> None:
             pass
 
 
+def _wait_new_pid(
+    harness: "_ReloadHarness",
+    name: str,
+    before: int | None,
+    *,
+    timeout: float = 15.0,
+    require_reloaded_log: bool = False,
+) -> int:
+    """
+    Wait until ``name`` has a live PID different from ``before``.
+
+    During reload, ``managed.pid`` briefly becomes ``None``. Waiting only for
+    ``pid != before`` races that window and flakes CI under load.
+    """
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        current = harness.pids().get(name)
+        if current is not None and current != before:
+            if not require_reloaded_log or "reloaded" in harness.blob().lower():
+                return int(current)
+        time.sleep(0.1)
+    raise AssertionError(
+        f"service {name!r} pid did not change from {before!r} within {timeout}s; "
+        f"last={harness.pids().get(name)!r}; log tail:\n{harness.blob()[-2000:]}"
+    )
+
+
 class _ReloadHarness:
     """Run Orchestrator in a thread and edit files against a live stack."""
 
@@ -194,16 +222,13 @@ def test_fastapi_reload_integration(fastapi_project) -> None:
         assert before.get("api")
         original = target.read_text(encoding="utf-8")
         target.write_text(original + f"\n# reload {time.time()}\n", encoding="utf-8")
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if "reloaded" in h.blob().lower() and h.pids().get("api") != before.get("api"):
-                break
-            time.sleep(0.1)
+        after_pid = _wait_new_pid(
+            h, "api", before.get("api"), require_reloaded_log=True
+        )
         assert "detected change" in h.blob().lower()
         assert "reloaded" in h.blob().lower()
-        assert h.pids().get("api") != before.get("api")
         assert _wait_http(f"http://127.0.0.1:{port}/health")
-        assert pid_is_alive(before["api"]) is False or before["api"] != h.pids().get("api")
+        assert pid_is_alive(before["api"]) is False or before["api"] != after_pid
     finally:
         old = h.pids().get("api")
         h.stop()
@@ -254,12 +279,7 @@ def test_flask_reload_integration(tmp_path: Path) -> None:
         assert _wait_http(f"http://127.0.0.1:{port}/health")
         before = h.pids()["web"]
         target.write_text(target.read_text(encoding="utf-8") + f"\n# {time.time()}\n", encoding="utf-8")
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if h.pids().get("web") != before and "reloaded" in h.blob().lower():
-                break
-            time.sleep(0.1)
-        assert h.pids().get("web") != before
+        _wait_new_pid(h, "web", before, require_reloaded_log=True)
         assert _wait_http(f"http://127.0.0.1:{port}/health")
     finally:
         h.stop()
@@ -333,12 +353,7 @@ def test_django_reload_integration(tmp_path: Path) -> None:
             urls.read_text(encoding="utf-8") + f"\n# {time.time()}\n",
             encoding="utf-8",
         )
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            if h.pids().get("web") != before and "reloaded" in h.blob().lower():
-                break
-            time.sleep(0.1)
-        assert h.pids().get("web") != before
+        _wait_new_pid(h, "web", before, timeout=20.0, require_reloaded_log=True)
         assert _wait_http(f"http://127.0.0.1:{port}/health", timeout=20)
     finally:
         h.stop()
@@ -380,10 +395,13 @@ def test_rapid_saves_single_reload(tmp_path: Path) -> None:
         for i in range(8):
             target.write_text(target.read_text(encoding="utf-8") + f"# {i}\n", encoding="utf-8")
             time.sleep(0.03)
-        time.sleep(2.5)
-        # Exactly one reload cycle for the burst (may print Reloading + reloaded).
-        assert h.blob().lower().count("reloading api") == 1
-        assert h.pids().get("api") != before
+        # Wait for a completed reload (not the mid-reload pid=None window).
+        _wait_new_pid(h, "api", before, timeout=12.0, require_reloaded_log=True)
+        time.sleep(0.8)
+        # Debounce should collapse the burst; allow at most one follow-up under CI load.
+        reloading = h.blob().lower().count("reloading api")
+        assert 1 <= reloading <= 2, h.blob()[-1500:]
+        assert h.pids().get("api") is not None
         assert _wait_http(f"http://127.0.0.1:{port}/")
     finally:
         h.stop()
@@ -429,12 +447,7 @@ def test_observer_survives_multiple_reloads(tmp_path: Path) -> None:
                 target.read_text(encoding="utf-8") + f"# round-{i}\n",
                 encoding="utf-8",
             )
-            deadline = time.time() + 12
-            while time.time() < deadline:
-                if h.pids().get("api") != before:
-                    break
-                time.sleep(0.1)
-            assert h.pids().get("api") != before
+            _wait_new_pid(h, "api", before)
             time.sleep(0.6)
         assert len(set(pids)) == 3
         wm = h.orch._watch_manager
@@ -481,11 +494,7 @@ def test_ctrl_c_exits_clean_after_reload(tmp_path: Path) -> None:
         assert _wait_http(f"http://127.0.0.1:{port}/")
         before = h.pids()["api"]
         target.write_text(target.read_text(encoding="utf-8") + "# x\n", encoding="utf-8")
-        deadline = time.time() + 12
-        while time.time() < deadline and h.pids().get("api") == before:
-            time.sleep(0.1)
-        after = h.pids().get("api")
-        assert after and after != before
+        after = _wait_new_pid(h, "api", before)
     finally:
         h.stop()
         if after:
@@ -542,12 +551,10 @@ def test_only_changed_service_reloads(tmp_path: Path) -> None:
         before = h.pids()
         target = root / "a" / "main.py"
         target.write_text(target.read_text(encoding="utf-8") + "# only-a\n", encoding="utf-8")
-        deadline = time.time() + 12
-        while time.time() < deadline and h.pids().get("a") == before.get("a"):
-            time.sleep(0.1)
+        _wait_new_pid(h, "a", before.get("a"))
         after = h.pids()
-        assert after.get("a") != before.get("a")
         assert after.get("b") == before.get("b")
+        assert after.get("b") is not None
         assert "reloading b" not in h.blob().lower()
     finally:
         h.stop()

@@ -12,6 +12,7 @@ jobs:
   publish:
     name: Build, verify, and publish
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: pypi
     permissions:
       contents: read
@@ -33,7 +34,13 @@ jobs:
           python -m pip install build twine
 
       - name: Run pytest
-        run: pytest -q
+        timeout-minutes: 30
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: >
+          pytest -vv -ra --maxfail=3 --durations=20 --color=yes
+          --tb=short --showlocals
+          --junitxml=pytest-results.xml
 
       - name: Build sdist and wheel
         run: python -m build
@@ -48,6 +55,7 @@ jobs:
           stackpilot doctor || true
           python -m stackpilot version
           python -m stackpilot --help
+          stackpilot --help
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

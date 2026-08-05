@@ -728,9 +728,11 @@ class TestWindowsWatcherReliability:
             )
         ]
         wm = WatchManager(debounce_s=0.05, log=lambda _m: None)
-        wm.start(specs, on_change=lambda *_a: None, project_root=tmp_path)
-        assert "web" in wm.watched_services
-        wm.stop()
+        try:
+            wm.start(specs, on_change=lambda *_a: None, project_root=tmp_path)
+            assert "web" in wm.watched_services
+        finally:
+            wm.stop()
         assert list(wm.watched_services) == []
         wm.stop()  # idempotent
 
