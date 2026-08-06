@@ -20,7 +20,7 @@ from .config import (
     parse_health_check,
 )
 from .http_checker import check_http
-from .port_detect import pid_tree_owns_port
+from .port_detect import listening_ports_for_pid, pid_tree_owns_port
 from .process_checker import check_process
 from .tcp_checker import check_tcp
 
@@ -100,12 +100,16 @@ class Health:
             remaining = max(0.05, deadline - clock())
             probe_cap = min(float(cfg.probe_timeout), remaining)
             if cls.dispatch(cfg, process=process, probe_timeout=probe_cap):
+                # Successful probe: confirm ownership without false-rejecting
+                # when macOS port→PID mapping lags behind the bind.
+                if cls._process_tree_listens(cfg, process=process):
+                    return clock() - started
                 ownership_after = cls._check_port_ownership(cfg, process=process)
                 if ownership_after is False:
                     port = cls._configured_port(cfg)
                     raise PortOwnershipError(name, int(port or 0))
-                # True: our tree owns the port. None: mapping unavailable but
-                # the endpoint already answered — accept healthy.
+                # True / None: accept — endpoint answered and no confirmed
+                # foreign owner remains.
                 return clock() - started
 
             if cls.timeout(deadline, clock=clock):
@@ -234,3 +238,24 @@ class Health:
         if port is None:
             return True
         return pid_tree_owns_port(int(process.pid), int(port))
+
+    @classmethod
+    def _process_tree_listens(
+        cls,
+        cfg: HealthCheck,
+        *,
+        process: Optional[Popen[str]],
+    ) -> bool:
+        """True when the spawned PID (or a direct listen table hit) owns ``port``."""
+
+        if process is None or process.pid is None:
+            return False
+        port = cls._configured_port(cfg)
+        if port is None:
+            return False
+        try:
+            if int(port) in listening_ports_for_pid(int(process.pid)):
+                return True
+        except Exception:
+            return False
+        return False

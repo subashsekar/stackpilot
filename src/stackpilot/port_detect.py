@@ -269,14 +269,28 @@ def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
     Ancestors of ``root_pid`` (test runners, shells, orchestrator parents) are
     never treated as part of the service tree — a parent-held listen socket is
     a foreign occupation even when the child shares the parent's process group.
+
+    On macOS CI, port→PID backends can briefly mis-attribute a just-bound
+    socket. We therefore also accept a positive match from
+    :func:`listening_ports_for_pid` on the spawned tree before declaring
+    foreign ownership.
     """
 
     if root_pid <= 0:
         return None
-    owners = pids_listening_on_port(port)
+
+    tree = _process_tree_pids(root_pid)
+    port_i = int(port)
+    for pid in tree:
+        try:
+            if port_i in listening_ports_for_pid(int(pid)):
+                return True
+        except Exception:
+            continue
+
+    owners = pids_listening_on_port(port_i)
     if not owners:
         return None
-    tree = _process_tree_pids(root_pid)
     ancestors = _ancestor_pids(root_pid)
     for owner in owners:
         if owner in ancestors:
@@ -869,16 +883,20 @@ def _listening_ports_windows(pid: int) -> List[int]:
 
 def _listening_ports_posix(pid: int) -> List[int]:
     # Prefer lsof when available.
-    completed = subprocess.run(
-        ["lsof", "-nP", f"-p{int(pid)}", "-iTCP", "-sTCP:LISTEN"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["lsof", "-nP", f"-p{int(pid)}", "-iTCP", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=0.5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        completed = None
     ports: set[int] = set()
-    if completed.returncode == 0 and completed.stdout:
+    if completed is not None and completed.returncode == 0 and completed.stdout:
         for line in completed.stdout.splitlines()[1:]:
             # COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
             # python  123 ... TCP *:8000 (LISTEN)

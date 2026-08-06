@@ -261,23 +261,22 @@ def test_runner_waits_for_http_before_dependent(
     marker = tmp_path / "auth_started"
     api_script = tmp_path / "api_server.py"
     api_script.write_text(
+        "import threading\n"
         "import time\n"
         "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
         f"PORT = {port}\n"
-        "time.sleep(0.8)\n"
+        "time.sleep(0.5)\n"
         "class H(BaseHTTPRequestHandler):\n"
-        "    hits = 0\n"
         "    def do_GET(self):\n"
-        "        H.hits += 1\n"
         "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
         "    def log_message(self, *a):\n"
         "        pass\n"
-        "print('api up', flush=True)\n"
+        "HTTPServer.allow_reuse_address = True\n"
         "srv = HTTPServer(('127.0.0.1', PORT), H)\n"
-        "srv.timeout = 0.5\n"
-        "deadline = time.time() + 12.0\n"
-        "while time.time() < deadline:\n"
-        "    srv.handle_request()\n",
+        "print('api up', flush=True)\n"
+        # Bound lifetime so Runner.monitor() can exit after dependents finish.
+        "threading.Timer(20.0, srv.shutdown).start()\n"
+        "srv.serve_forever()\n",
         encoding="utf-8",
     )
 

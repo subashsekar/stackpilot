@@ -29,17 +29,13 @@ def _free_port() -> int:
 
 
 def _wait_http(url: str, *, timeout: float = 20.0) -> bool:
-    import urllib.error
-    import urllib.request
+    from stackpilot.http_checker import check_http
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=1.0) as resp:
-                if 200 <= resp.status < 400:
-                    return True
-        except (urllib.error.URLError, TimeoutError, OSError):
-            time.sleep(0.1)
+        if check_http(url, request_timeout=1.0):
+            return True
+        time.sleep(0.1)
     return False
 
 
@@ -371,6 +367,7 @@ def test_rapid_saves_single_reload(tmp_path: Path) -> None:
         "    def do_GET(self):\n"
         "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
         "    def log_message(self, *a): pass\n"
+        "HTTPServer.allow_reuse_address = True\n"
         f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n",
     )
     stack = Stack()
@@ -419,6 +416,7 @@ def test_observer_survives_multiple_reloads(tmp_path: Path) -> None:
         "    def do_GET(self):\n"
         "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
         "    def log_message(self, *a): pass\n"
+        "HTTPServer.allow_reuse_address = True\n"
         f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n",
     )
     stack = Stack()
@@ -471,6 +469,7 @@ def test_ctrl_c_exits_clean_after_reload(tmp_path: Path) -> None:
         "    def do_GET(self):\n"
         "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
         "    def log_message(self, *a): pass\n"
+        "HTTPServer.allow_reuse_address = True\n"
         f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n",
     )
     stack = Stack()
