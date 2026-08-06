@@ -278,6 +278,44 @@ class TestProcessGroupAndChildCleanup:
         # Extremely unlikely live PID; should not raise.
         signal_process_tree(2_147_483_646, graceful=False)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX killpg guard only")
+    def test_signal_non_leader_does_not_killpg(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Non-leader PIDs must not be torn down via killpg.
+
+        A raw Popen child shares the pytest process group; killpg would
+        SIGTERM the runner (GitHub Actions exit 143).
+        """
+
+        import stackpilot.process_tree as process_tree
+
+        calls: list[tuple[str, int, int]] = []
+
+        monkeypatch.setattr(process_tree.os, "getpgid", lambda pid: 1111)
+        monkeypatch.setattr(
+            process_tree,
+            "_posix_descendant_pids",
+            lambda _pid: set(),
+        )
+
+        def fake_killpg(pgid: int, sig: int) -> None:
+            calls.append(("killpg", int(pgid), int(sig)))
+
+        def fake_kill(pid: int, sig: int) -> None:
+            calls.append(("kill", int(pid), int(sig)))
+
+        monkeypatch.setattr(process_tree.os, "killpg", fake_killpg)
+        monkeypatch.setattr(process_tree.os, "kill", fake_kill)
+
+        process_tree._signal_posix_tree(4242, graceful=True)
+        assert calls == [("kill", 4242, int(__import__("signal").SIGTERM))]
+        assert not any(kind == "killpg" for kind, *_ in calls)
+
+        calls.clear()
+        monkeypatch.setattr(process_tree.os, "getpgid", lambda pid: pid)
+        process_tree._signal_posix_tree(4242, graceful=False)
+        assert calls == [("killpg", 4242, int(__import__("signal").SIGKILL))]
+
 
 class TestPublicApiExports:
     def test_public_imports(self) -> None:

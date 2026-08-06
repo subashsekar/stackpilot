@@ -622,6 +622,9 @@ class TestProcessCleanup:
             logger.close()
 
     def test_runtime_json_cleaned_by_stop_session(self, tmp_path: Path) -> None:
+        # Intentionally omit start_new_session so the child shares this
+        # process group — stop_runtime_session must still terminate only
+        # the recorded PID (not killpg the pytest group → exit 143 on CI).
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             cwd=str(tmp_path),
@@ -654,6 +657,44 @@ class TestProcessCleanup:
             data = json.loads(payload.read_text(encoding="utf-8"))
             assert data.get("session_active") is False
             assert data.get("services") == []
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shared-PG regression")
+    def test_stop_runtime_session_does_not_signal_pytest_group(
+        self, tmp_path: Path
+    ) -> None:
+        """Shared process-group children must not take down the test runner."""
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=str(tmp_path),
+        )
+        assert proc.pid is not None
+        assert os.getpgid(proc.pid) == os.getpgid(os.getpid())
+        try:
+            save_runtime_snapshot(
+                tmp_path,
+                {
+                    "session_active": True,
+                    "services": [
+                        {
+                            "name": "api",
+                            "pid": proc.pid,
+                            "port": 0,
+                            "status": "RUNNING",
+                            "command": "sleep",
+                        }
+                    ],
+                },
+            )
+            result = stop_runtime_session(tmp_path, timeout_s=2.0)
+            assert result.exit_code == 0
+            assert not pid_is_alive(proc.pid)
+            # If killpg hit our group we would not reach these asserts.
+            assert os.getpid() > 0
         finally:
             if proc.poll() is None:
                 proc.kill()

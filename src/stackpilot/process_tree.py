@@ -41,19 +41,80 @@ def signal_process_tree(pid: int, *, graceful: bool) -> None:
 
 
 def _signal_posix_tree(pid: int, *, graceful: bool) -> None:
+    """
+    Signal ``pid`` and its tree on POSIX.
+
+    ``killpg`` is used only when ``pid`` is the process-group leader
+    (``getpgid(pid) == pid``). StackPilot spawns with ``start_new_session=True``,
+    so managed children are leaders and group teardown is correct.
+
+    For a non-leader PID (e.g. a raw ``Popen`` recorded in ``runtime.json``
+    that still shares the caller's group), ``killpg`` would SIGTERM the
+    StackPilot / pytest process group as well — CI surfaces that as exit 143.
+    In that case signal only the target PID and its descendants.
+    """
+
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError, OSError):
         return
 
     sig = signal.SIGTERM if graceful else signal.SIGKILL
-    try:
-        os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
+    root = int(pid)
+
+    if pgid == root:
         try:
-            os.kill(pid, sig)
+            os.killpg(pgid, sig)
+            return
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+    # Non-leader (or killpg failed): never broaden to the shared parent group.
+    for target in _posix_descendant_pids(root) | {root}:
+        try:
+            os.kill(target, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _posix_descendant_pids(root_pid: int) -> set[int]:
+    """Best-effort descendant PIDs of ``root_pid`` (exclusive of itself)."""
+
+    children_of: dict[int, list[int]] = {}
+    try:
+        completed = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return set()
+
+    for line in (completed.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            child = int(parts[0])
+            parent = int(parts[1])
+        except ValueError:
+            continue
+        children_of.setdefault(parent, []).append(child)
+
+    found: set[int] = set()
+    queue = [int(root_pid)]
+    while queue:
+        current = queue.pop()
+        for child in children_of.get(current, ()):
+            if child in found or child == root_pid:
+                continue
+            found.add(child)
+            queue.append(child)
+    return found
 
 
 def _signal_windows_tree(pid: int, *, graceful: bool) -> None:
