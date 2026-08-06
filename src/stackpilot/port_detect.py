@@ -281,6 +281,26 @@ def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
 
     tree = _process_tree_pids(root_pid)
     port_i = int(port)
+    ancestors = _ancestor_pids(root_pid)
+    owners = pids_listening_on_port(port_i)
+
+    # Parent / test-runner held sockets: reverse port→PID can be empty on
+    # locked-down CI, but /proc still shows the listen on our own PID.
+    if not owners:
+        try:
+            self_pid = os.getpid()
+            if self_pid not in tree and port_i in listening_ports_for_pid(self_pid):
+                return False
+        except Exception:
+            pass
+
+    # Ancestor occupation is always foreign — including when the child also
+    # appears in the listen table because it inherited the socket FD.
+    if owners and any(o in ancestors for o in owners):
+        return False
+
+    # Positive confirm via forward PID→ports. Reverse map may briefly
+    # mis-attribute a stranger on macOS; forward tree listen wins then.
     for pid in tree:
         try:
             if port_i in listening_ports_for_pid(int(pid)):
@@ -288,13 +308,9 @@ def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
         except Exception:
             continue
 
-    owners = pids_listening_on_port(port_i)
     if not owners:
         return None
-    ancestors = _ancestor_pids(root_pid)
     for owner in owners:
-        if owner in ancestors:
-            continue
         if owner in tree:
             return True
     return False

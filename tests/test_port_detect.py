@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -388,3 +389,41 @@ def test_pid_tree_owns_port_still_rejects_confirmed_foreign(
     monkeypatch.setattr(port_detect, "_process_tree_pids", lambda pid: {int(pid)})
     monkeypatch.setattr(port_detect, "_ancestor_pids", lambda _pid: set())
     assert port_detect.pid_tree_owns_port(4242, 18080) is False
+
+
+def test_pid_tree_owns_port_rejects_ancestor_held_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent-held listen sockets are foreign even when reverse map is empty."""
+
+    monkeypatch.setattr(port_detect, "pids_listening_on_port", lambda _port: [])
+    monkeypatch.setattr(
+        port_detect,
+        "listening_ports_for_pid",
+        lambda pid: [18080] if int(pid) == os.getpid() else [],
+    )
+    monkeypatch.setattr(port_detect, "_process_tree_pids", lambda pid: {int(pid)})
+    monkeypatch.setattr(port_detect, "_ancestor_pids", lambda _pid: {os.getpid()})
+    assert port_detect.pid_tree_owns_port(4242, 18080) is False
+
+
+def test_pid_tree_owns_port_rejects_inherited_fd_with_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward listen on the child is ignored when an ancestor also owns it."""
+
+    parent = 1111
+    child = 4242
+    monkeypatch.setattr(
+        port_detect,
+        "pids_listening_on_port",
+        lambda _port: [parent, child],
+    )
+    monkeypatch.setattr(
+        port_detect,
+        "listening_ports_for_pid",
+        lambda pid: [18080] if int(pid) in {parent, child} else [],
+    )
+    monkeypatch.setattr(port_detect, "_process_tree_pids", lambda pid: {int(pid)})
+    monkeypatch.setattr(port_detect, "_ancestor_pids", lambda _pid: {parent})
+    assert port_detect.pid_tree_owns_port(child, 18080) is False
