@@ -237,6 +237,44 @@ def test_http_checker_ignores_env_proxy(
         stop.set()
 
 
+def test_http_health_accepts_probe_when_port_mapping_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX CI can mis-attribute port owners; trust HTTP GET + live child."""
+
+    stop = threading.Event()
+    try:
+        base = _serve_http_until(ready_after_s=0.0, stop=stop)
+        url = f"{base}/health"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        try:
+            monkeypatch.setattr(
+                "stackpilot.health.pid_tree_owns_port",
+                lambda _pid, _port: False,
+            )
+            monkeypatch.setattr(
+                "stackpilot.health._process_tree_pids",
+                lambda pid: {int(pid)},
+            )
+            monkeypatch.setattr(
+                "stackpilot.health.listening_ports_for_pid",
+                lambda _pid: [],
+            )
+            elapsed = Health.wait_until_healthy(
+                "api",
+                {"type": "http", "url": url, "interval": 0.05, "timeout": 2},
+                process=proc,
+            )
+            assert elapsed >= 0.0
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        stop.set()
+
+
 def test_dispatch_unknown_type_raises() -> None:
     with pytest.raises(HealthCheckError, match="Unknown health check type"):
         Health.dispatch({"type": "magic"})
