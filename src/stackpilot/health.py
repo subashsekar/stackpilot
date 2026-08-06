@@ -95,11 +95,11 @@ class Health:
                 if process.pid is None or process.poll() is not None:
                     raise HealthCheckTimeout(name)
 
-            # Probe first and only. Port→PID backends (lsof/netstat) are slow on
-            # macOS CI; running them on every connection-refused tick starved
-            # readiness inside short health windows. Foreign listeners are still
-            # rejected after a *successful* probe via ownership_after is False.
-            if cls.dispatch(cfg, process=process):
+            # Cap each probe by the remaining health budget so a stuck
+            # transport cannot overrun the configured timeout.
+            remaining = max(0.05, deadline - clock())
+            probe_cap = min(float(cfg.probe_timeout), remaining)
+            if cls.dispatch(cfg, process=process, probe_timeout=probe_cap):
                 ownership_after = cls._check_port_ownership(cfg, process=process)
                 if ownership_after is False:
                     port = cls._configured_port(cfg)
@@ -118,6 +118,7 @@ class Health:
         health_check: Union[HealthCheck, Mapping],
         *,
         process: Optional[Popen[str]] = None,
+        probe_timeout: float | None = None,
     ) -> bool:
         """Run a single health-check attempt. Returns True when healthy."""
 
@@ -133,15 +134,19 @@ class Health:
         except ValueError as exc:
             raise HealthCheckError(str(exc)) from exc
 
-        probe_timeout = float(cfg.probe_timeout)
+        timeout = (
+            float(probe_timeout)
+            if probe_timeout is not None
+            else float(cfg.probe_timeout)
+        )
 
         if isinstance(cfg, HttpHealthCheck):
             if not cfg.url:
                 return False
-            return check_http(cfg.url, request_timeout=probe_timeout)
+            return check_http(cfg.url, request_timeout=timeout)
 
         if isinstance(cfg, TcpHealthCheck):
-            return check_tcp(cfg.host, cfg.port, connect_timeout=probe_timeout)
+            return check_tcp(cfg.host, cfg.port, connect_timeout=timeout)
 
         if isinstance(cfg, ProcessHealthCheck):
             return check_process(process)

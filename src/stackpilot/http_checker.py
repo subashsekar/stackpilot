@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
+import http.client
+import socket
 from dataclasses import dataclass
 from typing import Mapping, Optional, Union
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener
 
 from .config import HttpHealthCheck
 
 ALLOWED_HTTP_SCHEMES = frozenset({"http", "https"})
-
-# Health probes must never inherit HTTP(S)_PROXY from the environment —
-# macOS/Linux CI runners sometimes set a proxy that black-holes 127.0.0.1
-# and burns the full probe_timeout on every attempt.
-_NO_PROXY_OPENER = build_opener(ProxyHandler({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +48,14 @@ def check_http(url: str, *, request_timeout: float = 2.0) -> bool:
 
 
 def probe_http(url: str, *, request_timeout: float = 2.0) -> HttpProbeResult:
-    """Probe ``url`` once and classify the result."""
+    """
+    Probe ``url`` once and classify the result.
+
+    Uses :mod:`http.client` (not ``urllib``) so probes never follow
+    ``HTTP(S)_PROXY`` / macOS system proxy settings. Those proxies have been
+    observed on GitHub Actions macOS runners to black-hole ``127.0.0.1`` and
+    ignore urllib timeouts, starving service health checks.
+    """
 
     text = (url or "").strip()
     if not text:
@@ -69,28 +71,44 @@ def probe_http(url: str, *, request_timeout: float = 2.0) -> HttpProbeResult:
             kind="error",
             detail=f"url must use http or https scheme (got {scheme!r})",
         )
-    if not parsed.netloc:
+    host = parsed.hostname
+    if not host:
         return HttpProbeResult(kind="error", detail="url must include a host")
 
-    request = Request(text, method="GET")
+    # Prefer numeric / explicit host; never re-resolve "localhost" via DNS
+    # (macOS may prefer ::1 while the service bound 127.0.0.1 only).
+    if host in {"localhost", "0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    timeout = max(0.05, float(request_timeout))
+    conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
     try:
-        with _NO_PROXY_OPENER.open(request, timeout=request_timeout) as response:
-            code = int(response.status)
-            return _from_status(code)
-    except HTTPError as exc:
-        code = int(getattr(exc, "code", 0) or 0)
-        return _from_status(code)
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, int(port), timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
+        conn.request("GET", path, headers={"Connection": "close"})
+        response = conn.getresponse()
+        try:
+            # Drain body so the connection can close cleanly.
+            response.read()
+        except Exception:
+            pass
+        return _from_status(int(response.status))
     except TimeoutError:
         return HttpProbeResult(kind="timeout", detail="Timeout")
-    except URLError as exc:
-        reason = exc.reason
-        message = str(reason) if reason is not None else str(exc)
-        lower = message.lower()
-        if "timed out" in lower or "timeout" in lower:
-            return HttpProbeResult(kind="timeout", detail="Timeout")
-        if "refused" in lower:
-            return HttpProbeResult(kind="refused", detail="Connection refused")
-        return HttpProbeResult(kind="error", detail=message or "URL error")
+    except socket.timeout:
+        return HttpProbeResult(kind="timeout", detail="Timeout")
+    except ConnectionRefusedError:
+        return HttpProbeResult(kind="refused", detail="Connection refused")
     except OSError as exc:
         message = str(exc)
         lower = message.lower()
@@ -98,7 +116,15 @@ def probe_http(url: str, *, request_timeout: float = 2.0) -> HttpProbeResult:
             return HttpProbeResult(kind="refused", detail="Connection refused")
         if "timed out" in lower or "timeout" in lower:
             return HttpProbeResult(kind="timeout", detail="Timeout")
-        return HttpProbeResult(kind="error", detail=message)
+        return HttpProbeResult(kind="error", detail=message or "OS error")
+    except http.client.HTTPException as exc:
+        return HttpProbeResult(kind="error", detail=str(exc) or "HTTP error")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _from_status(code: int) -> HttpProbeResult:

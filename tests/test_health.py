@@ -228,7 +228,11 @@ def test_http_checker_ignores_env_proxy(
         monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
         monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
         monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
         assert check_http(url, request_timeout=1.0) is True
+        from stackpilot.http_checker import probe_http
+
+        assert probe_http(url, request_timeout=1.0).kind == "healthy"
     finally:
         stop.set()
 
