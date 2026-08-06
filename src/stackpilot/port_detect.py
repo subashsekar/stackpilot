@@ -265,6 +265,10 @@ def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
       ``True``  — a listener on ``port`` belongs to the StackPilot-spawned tree
       ``False`` — a foreign process owns the listen socket
       ``None``  — nothing is listening on ``port`` yet
+
+    Ancestors of ``root_pid`` (test runners, shells, orchestrator parents) are
+    never treated as part of the service tree — a parent-held listen socket is
+    a foreign occupation even when the child shares the parent's process group.
     """
 
     if root_pid <= 0:
@@ -273,14 +277,29 @@ def pid_tree_owns_port(root_pid: int, port: int) -> Optional[bool]:
     if not owners:
         return None
     tree = _process_tree_pids(root_pid)
+    ancestors = _ancestor_pids(root_pid)
     for owner in owners:
+        if owner in ancestors:
+            continue
         if owner in tree:
             return True
     return False
 
 
 def _process_tree_pids(root_pid: int) -> set[int]:
-    """PIDs in the spawned tree: root, descendants, and POSIX process-group peers."""
+    """
+    PIDs in the spawned tree: root, descendants, and (when safe) PG peers.
+
+    POSIX process-group expansion is only applied when ``root_pid`` is the
+    process-group leader (``getpgid(pid) == pid``). StackPilot spawns with
+    ``start_new_session=True``, so managed children are leaders and workers
+    that remain in the same group are correctly included.
+
+    Expanding the group for a non-leader child (e.g. a raw ``Popen`` that
+    inherits the pytest / shell process group) would incorrectly treat the
+    parent process — and any foreign listener it holds — as part of the
+    service tree, producing a false healthy state on Linux/macOS.
+    """
 
     tree: set[int] = {int(root_pid)}
     try:
@@ -290,10 +309,36 @@ def _process_tree_pids(root_pid: int) -> set[int]:
     if sys.platform != "win32":
         try:
             pgid = os.getpgid(root_pid)
-            tree.update(_pids_in_process_group(pgid))
+            # Only trust PG peers when this PID leads the group.
+            if pgid == int(root_pid):
+                tree.update(_pids_in_process_group(pgid))
         except (ProcessLookupError, PermissionError, OSError):
             pass
     return tree
+
+
+def _ancestor_pids(root_pid: int) -> set[int]:
+    """Best-effort parent chain of ``root_pid`` (exclusive of itself)."""
+
+    ancestors: set[int] = set()
+    try:
+        pairs = (
+            _windows_pid_ppid_pairs()
+            if sys.platform == "win32"
+            else _posix_pid_ppid_pairs()
+        )
+    except Exception:
+        return ancestors
+    parent_of = {pid: ppid for pid, ppid in pairs}
+    current = int(root_pid)
+    # Bound the walk so a corrupt / cyclic ppid map cannot loop forever.
+    for _ in range(64):
+        parent = parent_of.get(current)
+        if parent is None or parent <= 0 or parent == current or parent in ancestors:
+            break
+        ancestors.add(parent)
+        current = parent
+    return ancestors
 
 
 def _descendant_pids(root_pid: int) -> set[int]:
@@ -510,6 +555,64 @@ def _pids_listening_on_port_windows(port: int) -> List[int]:
 
 
 def _pids_listening_on_port_posix(port: int) -> List[int]:
+    """
+    Resolve LISTEN owners for ``port`` on POSIX.
+
+    Backends (first non-empty wins):
+    1. optional ``psutil``
+    2. ``lsof``
+    3. Linux ``/proc/net/tcp{,6}`` + fd inode map
+    4. ``ss -lptn``
+    5. ``netstat -lptn`` / ``netstat -anv`` (macOS)
+    """
+
+    port = int(port)
+    for resolver in (
+        _pids_listening_on_port_psutil,
+        _pids_listening_on_port_lsof,
+        _pids_listening_on_port_linux_proc if sys.platform.startswith("linux") else None,
+        _pids_listening_on_port_ss,
+        _pids_listening_on_port_netstat_posix,
+    ):
+        if resolver is None:
+            continue
+        try:
+            found = resolver(port)
+        except Exception:
+            continue
+        if found:
+            return sorted(set(int(pid) for pid in found if int(pid) > 0))
+    return []
+
+
+def _pids_listening_on_port_psutil(port: int) -> List[int]:
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return []
+    pids: set[int] = set()
+    try:
+        connections = psutil.net_connections(kind="tcp")
+    except (psutil.AccessDenied, psutil.Error, OSError, AttributeError):
+        return []
+    for conn in connections:
+        try:
+            if conn.status != psutil.CONN_LISTEN:
+                continue
+            laddr = conn.laddr
+            if not laddr:
+                continue
+            local_port = int(getattr(laddr, "port", None) or laddr[1])
+            if local_port != port:
+                continue
+            if conn.pid:
+                pids.add(int(conn.pid))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return sorted(pids)
+
+
+def _pids_listening_on_port_lsof(port: int) -> List[int]:
     completed = subprocess.run(
         ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
         capture_output=True,
@@ -519,20 +622,101 @@ def _pids_listening_on_port_posix(port: int) -> List[int]:
         check=False,
     )
     pids: set[int] = set()
-    if completed.returncode == 0 and completed.stdout:
-        for line in completed.stdout.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) < 2:
+    if completed.returncode != 0 or not completed.stdout:
+        return []
+    for line in completed.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pids.add(int(parts[1]))
+        except ValueError:
+            continue
+    return sorted(pids)
+
+
+def _pids_listening_on_port_ss(port: int) -> List[int]:
+    """Parse ``ss -lptn`` listeners (Linux; often available when lsof is not)."""
+
+    completed = subprocess.run(
+        ["ss", "-lptn"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return []
+    pids: set[int] = set()
+    # Example: LISTEN 0 128 127.0.0.1:8000 0.0.0.0:* users:(("python",pid=123,fd=3))
+    port_token = f":{int(port)}"
+    for line in completed.stdout.splitlines():
+        if "LISTEN" not in line.upper():
+            continue
+        # Local address is typically column 4 in `ss -lptn`.
+        parts = line.split()
+        local = parts[3] if len(parts) >= 4 else ""
+        if not (
+            local.endswith(port_token)
+            or f"]:{int(port)}" in local
+            or local.endswith(f"]:{int(port)}")
+        ):
+            # Also accept ":PORT" anywhere before the users= blob for IPv6 forms.
+            before_users = line.split("users:", 1)[0]
+            if not re.search(rf"[:\]]{int(port)}\b", before_users):
                 continue
+        for match in re.finditer(r"pid=(\d+)", line):
             try:
-                pids.add(int(parts[1]))
+                pids.add(int(match.group(1)))
             except ValueError:
                 continue
+    return sorted(pids)
+
+
+def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
+    """Best-effort ``netstat`` parse for Linux/macOS when ss/lsof are absent."""
+
+    candidates = (
+        ["netstat", "-lptn"],
+        ["netstat", "-anv", "-p", "tcp"],
+        ["netstat", "-an", "-p", "tcp"],
+    )
+    pids: set[int] = set()
+    port_suffix = f".{int(port)}"  # macOS often uses *.8000 / 127.0.0.1.8000
+    port_colon = f":{int(port)}"
+    for argv in candidates:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if not completed.stdout:
+            continue
+        for line in completed.stdout.splitlines():
+            upper = line.upper()
+            if "LISTEN" not in upper:
+                continue
+            if port_colon not in line and port_suffix not in line:
+                continue
+            # Linux: ... LISTEN 1234/python
+            match = re.search(r"\b(\d+)/(?:\S+)", line)
+            if match:
+                pids.add(int(match.group(1)))
+                continue
+            # macOS netstat -anv: pid is often near the end as an integer column.
+            parts = line.split()
+            for token in reversed(parts):
+                if token.isdigit():
+                    value = int(token)
+                    if value > 0:
+                        pids.add(value)
+                        break
         if pids:
             return sorted(pids)
-
-    if sys.platform.startswith("linux"):
-        return _pids_listening_on_port_linux_proc(port)
     return sorted(pids)
 
 

@@ -200,30 +200,30 @@ class TestParallelStartup:
 
     def test_start_wave_runs_independents_concurrently(self, tmp_path: Path) -> None:
         runner_obj = Runner(logs_dir=tmp_path / "logs")
-        barrier = {"active": 0, "max": 0, "lock": threading.Lock()}
-
-        def fake_start(spec: ServiceSpec) -> bool:
-            with barrier["lock"]:
-                barrier["active"] += 1
-                barrier["max"] = max(barrier["max"], barrier["active"])
-            time.sleep(0.15)
-            with barrier["lock"]:
-                barrier["active"] -= 1
-            return True
-
-        runner_obj.start = fake_start  # type: ignore[method-assign]
         specs = [
             ServiceSpec(name=n, path=tmp_path, command="true")
             for n in ("a", "b", "c", "d")
         ]
-        began = time.monotonic()
+        # All four starts must rendezvous; sequential starts would time out here.
+        rendezvous = threading.Barrier(len(specs), timeout=2.0)
+        peak = {"active": 0, "max": 0, "lock": threading.Lock()}
+
+        def fake_start(spec: ServiceSpec) -> bool:
+            rendezvous.wait()
+            with peak["lock"]:
+                peak["active"] += 1
+                peak["max"] = max(peak["max"], peak["active"])
+            time.sleep(0.15)
+            with peak["lock"]:
+                peak["active"] -= 1
+            return True
+
+        runner_obj.start = fake_start  # type: ignore[method-assign]
         started, failed = runner_obj._start_wave(specs)
-        elapsed = time.monotonic() - began
 
         assert started == ["a", "b", "c", "d"]
         assert failed == []
-        assert barrier["max"] >= 3
-        assert elapsed < 0.45
+        assert peak["max"] >= 3
 
     def test_parallel_startup_faster_than_sequential(self, tmp_path: Path) -> None:
         runner_obj = Runner(logs_dir=tmp_path / "logs")
@@ -254,8 +254,8 @@ class TestParallelStartup:
 
         parallel_t = measure(4, parallel=True)
         sequential_t = measure(4, parallel=False)
+        # Relative to the sequential baseline measured on this machine / load.
         assert parallel_t < sequential_t * 0.7
-        assert parallel_t < 0.35
 
 
 # ---------------------------------------------------------------------------

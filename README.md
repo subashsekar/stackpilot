@@ -1,6 +1,6 @@
 # StackPilot
 
-[![CI](https://github.com/stackpilot-dev/stackpilot/actions/workflows/ci.yml/badge.svg)](https://github.com/stackpilot-dev/stackpilot/actions/workflows/ci.yml)
+[![CI](https://github.com/subashsekar/stackpilot/actions/workflows/ci.yml/badge.svg)](https://github.com/subashsekar/stackpilot/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/stackpilot.svg)](https://pypi.org/project/stackpilot/)
 [![Python versions](https://img.shields.io/pypi/pyversions/stackpilot.svg)](https://pypi.org/project/stackpilot/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -54,7 +54,7 @@ python -m stackpilot version
 ### From source (contributors)
 
 ```bash
-git clone https://github.com/stackpilot-dev/stackpilot.git
+git clone https://github.com/subashsekar/stackpilot.git
 cd stackpilot
 python -m pip install -e ".[dev]"
 pytest

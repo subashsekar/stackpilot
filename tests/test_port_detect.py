@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from stackpilot import port_detect
 from stackpilot.config import HttpHealthCheck, ServiceSpec, TcpHealthCheck
 from stackpilot.models import configured_port
 from stackpilot.port_detect import (
@@ -120,3 +123,142 @@ def test_service_display_url_from_port(tmp_path: Path) -> None:
         )
         == "http://127.0.0.1:9000"
     )
+
+
+# ---------------------------------------------------------------------------
+# Port ownership — Linux process-group / foreign listener regressions
+# ---------------------------------------------------------------------------
+
+
+def test_pid_tree_does_not_claim_ancestor_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Parent-held listen sockets must never count as owned by a child service.
+
+    On Ubuntu CI the pytest process owns the foreign TCP socket while the
+    dummy service is a raw Popen child sharing that process group. Including
+    non-leader PG peers previously made ``pid_tree_owns_port`` return True.
+    """
+
+    child_pid = 4242
+    parent_pid = 1000
+    port = 55555
+
+    monkeypatch.setattr(
+        port_detect,
+        "pids_listening_on_port",
+        lambda _port: [parent_pid],
+    )
+    monkeypatch.setattr(
+        port_detect,
+        "_process_tree_pids",
+        lambda _root: {child_pid, parent_pid},  # buggy expansion would include parent
+    )
+    monkeypatch.setattr(
+        port_detect,
+        "_ancestor_pids",
+        lambda _root: {parent_pid},
+    )
+    assert port_detect.pid_tree_owns_port(child_pid, port) is False
+
+
+def test_process_tree_skips_pg_peers_when_not_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only session/group leaders expand to process-group peers (POSIX)."""
+
+    root = 7777
+    peer = 8888
+
+    monkeypatch.setattr(port_detect.sys, "platform", "linux")
+    monkeypatch.setattr(port_detect, "_descendant_pids", lambda _pid: set())
+    # Windows runners have no os.getpgid; create the attribute for this test.
+    monkeypatch.setattr(port_detect.os, "getpgid", lambda pid: 1111, raising=False)
+    monkeypatch.setattr(
+        port_detect,
+        "_pids_in_process_group",
+        lambda _pgid: {root, peer, 1111},
+    )
+    tree = port_detect._process_tree_pids(root)
+    assert tree == {root}
+    assert peer not in tree
+
+
+def test_process_tree_includes_pg_peers_when_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = 7777
+    worker = 8888
+
+    monkeypatch.setattr(port_detect.sys, "platform", "linux")
+    monkeypatch.setattr(port_detect, "_descendant_pids", lambda _pid: set())
+    monkeypatch.setattr(port_detect.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(
+        port_detect,
+        "_pids_in_process_group",
+        lambda _pgid: {root, worker},
+    )
+    tree = port_detect._process_tree_pids(root)
+    assert tree == {root, worker}
+
+
+def test_foreign_tcp_listener_raises_port_ownership_error() -> None:
+    """End-to-end: foreign LISTEN + unrelated child => PortOwnershipError."""
+
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    from stackpilot.config import TcpHealthCheck
+    from stackpilot.health import Health, PortOwnershipError
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = int(probe.getsockname()[1])
+    probe.close()
+
+    foreign = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    foreign.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    foreign.bind(("127.0.0.1", port))
+    foreign.listen(1)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        with pytest.raises(PortOwnershipError) as exc:
+            Health.wait_until_healthy(
+                "db",
+                TcpHealthCheck(
+                    host="127.0.0.1",
+                    port=port,
+                    timeout=2.0,
+                    interval=0.1,
+                    probe_timeout=0.2,
+                ),
+                process=proc,
+            )
+        assert exc.value.port == port
+        assert port_detect.pid_tree_owns_port(proc.pid, port) is False
+    finally:
+        foreign.close()
+        proc.kill()
+        proc.wait(timeout=5)
+        time.sleep(0.05)
+
+
+def test_pids_listening_backends_tolerate_missing_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ss/netstat/lsof failures must not abort; empty backends return []."""
+
+    monkeypatch.setattr(port_detect.sys, "platform", "linux")
+
+    def boom(_port: int):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(port_detect, "_pids_listening_on_port_psutil", boom)
+    monkeypatch.setattr(port_detect, "_pids_listening_on_port_lsof", boom)
+    monkeypatch.setattr(port_detect, "_pids_listening_on_port_linux_proc", lambda _p: [])
+    monkeypatch.setattr(port_detect, "_pids_listening_on_port_ss", boom)
+    monkeypatch.setattr(port_detect, "_pids_listening_on_port_netstat_posix", boom)
+    assert port_detect._pids_listening_on_port_posix(18080) == []

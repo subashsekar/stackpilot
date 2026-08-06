@@ -11,7 +11,7 @@
 
 If you discover a security issue in StackPilot, please report it privately.
 
-1. Prefer a [GitHub security advisory](https://github.com/stackpilot-dev/stackpilot/security/advisories/new) on the StackPilot repository.
+1. Prefer a [GitHub security advisory](https://github.com/subashsekar/stackpilot/security/advisories/new) on the StackPilot repository.
 2. Include OS, Python version, the relevant `Stackfile.py` snippet, and steps to reproduce.
 3. Do **not** open a public issue for unfixed vulnerabilities.
 

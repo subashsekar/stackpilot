@@ -54,12 +54,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/stackpilot-dev/stackpilot"
-Repository = "https://github.com/stackpilot-dev/stackpilot"
-Documentation = "https://github.com/stackpilot-dev/stackpilot#readme"
-Changelog = "https://github.com/stackpilot-dev/stackpilot/blob/main/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/stackpilot-dev/stackpilot/issues"
-"Security Policy" = "https://github.com/stackpilot-dev/stackpilot/blob/main/SECURITY.md"
+Homepage = "https://github.com/subashsekar/stackpilot"
+Repository = "https://github.com/subashsekar/stackpilot"
+Documentation = "https://github.com/subashsekar/stackpilot#readme"
+Changelog = "https://github.com/subashsekar/stackpilot/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/subashsekar/stackpilot/issues"
+"Security Policy" = "https://github.com/subashsekar/stackpilot/blob/main/SECURITY.md"
 
 [project.scripts]
 stackpilot = "stackpilot.cli:main"

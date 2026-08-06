@@ -1,9 +1,56 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import typer
+
+
+def _help_should_emit_ansi() -> bool:
+    """True only for interactive color-capable terminals outside CI/pytest."""
+
+    if os.environ.get("NO_COLOR", "").strip():
+        return False
+    if os.environ.get("CI", "").strip() or os.environ.get("GITHUB_ACTIONS", "").strip():
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST", "").strip():
+        return False
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def configure_cli_help_rendering() -> None:
+    """
+    Keep root ``--help`` deterministic under CI/pytest; Rich colors on TTYs.
+
+    Typer's ``rich_utils`` sets ``FORCE_TERMINAL=True`` when ``GITHUB_ACTIONS``
+    (or ``FORCE_COLOR``) is present. That injects ANSI SGR codes into the Rich
+    command panel (``\\x1b[2m│\\x1b[0m … \\x1b[1minit…``). The frozen CLI
+    surface parser then matches zero command names (``listed == []``).
+
+    Automated contexts keep Rich panel *layout* (so ``│ name   help`` rows
+    stay parseable) but disable forced terminal coloring. Interactive TTYs
+    keep the normal colorful Rich help.
+    """
+
+    if _help_should_emit_ansi():
+        return
+
+    # Evaluated at import-time by typer.rich_utils; set before first help render.
+    os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+    try:
+        import typer.rich_utils as rich_utils
+    except Exception:
+        return
+    rich_utils.FORCE_TERMINAL = False
+    rich_utils.COLOR_SYSTEM = None
+
+
+configure_cli_help_rendering()
 
 from . import __version__
 from .dependency_graph import (
@@ -74,6 +121,9 @@ PUBLIC_CLI_COMMANDS = (
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
+    # Rich panels when Rich is installed (parseable ``│ name   help`` rows).
+    # ANSI color is gated by configure_cli_help_rendering() for CI/pytest.
+    rich_markup_mode="rich",
     help=(
         "StackPilot: local microservice orchestrator.\n\n"
         "Discover services, start them in dependency order, stream logs, "
@@ -84,7 +134,7 @@ app = typer.Typer(
         "  stackpilot sync\n"
         "  stackpilot run\n"
         "  stackpilot doctor\n\n"
-        "Docs: https://github.com/stackpilot-dev/stackpilot#readme"
+        "Docs: https://github.com/subashsekar/stackpilot#readme"
     ),
 )
 
@@ -92,6 +142,7 @@ app = typer.Typer(
 def main() -> None:
     """Console-script and ``python -m stackpilot`` entry point."""
 
+    configure_cli_help_rendering()
     app()
 
 
