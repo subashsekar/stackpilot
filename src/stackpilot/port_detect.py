@@ -606,7 +606,9 @@ def _pids_listening_on_port_psutil(port: int) -> List[int]:
             if local_port != port:
                 continue
             if conn.pid:
-                pids.add(int(conn.pid))
+                pid = int(conn.pid)
+                if pid > 1:
+                    pids.add(pid)
         except (TypeError, ValueError, AttributeError):
             continue
     return sorted(pids)
@@ -621,7 +623,7 @@ def _pids_listening_on_port_lsof(port: int) -> List[int]:
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=2.0,
+            timeout=0.5,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -633,9 +635,11 @@ def _pids_listening_on_port_lsof(port: int) -> List[int]:
         if len(parts) < 2:
             continue
         try:
-            pids.add(int(parts[1]))
+            pid = int(parts[1])
         except ValueError:
             continue
+        if pid > 1:
+            pids.add(pid)
     return sorted(pids)
 
 
@@ -650,7 +654,7 @@ def _pids_listening_on_port_ss(port: int) -> List[int]:
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=2.0,
+            timeout=0.5,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -674,20 +678,29 @@ def _pids_listening_on_port_ss(port: int) -> List[int]:
                 continue
         for match in re.finditer(r"pid=(\d+)", line):
             try:
-                pids.add(int(match.group(1)))
+                pid = int(match.group(1))
             except ValueError:
                 continue
+            if pid > 1:
+                pids.add(pid)
     return sorted(pids)
 
 
 def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
     """Best-effort ``netstat`` parse for Linux/macOS when ss/lsof are absent."""
 
-    candidates = (
-        ["netstat", "-lptn"],
-        ["netstat", "-anv", "-p", "tcp"],
-        ["netstat", "-an", "-p", "tcp"],
-    )
+    if sys.platform == "darwin":
+        # Linux-style -lptn is invalid on macOS; skip it to avoid timeout noise.
+        candidates = (
+            ["netstat", "-anv", "-p", "tcp"],
+            ["netstat", "-an", "-p", "tcp"],
+        )
+    else:
+        candidates = (
+            ["netstat", "-lptn"],
+            ["netstat", "-anv", "-p", "tcp"],
+            ["netstat", "-an", "-p", "tcp"],
+        )
     pids: set[int] = set()
     target = int(port)
     for argv in candidates:
@@ -699,7 +712,7 @@ def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
-                timeout=2.0,
+                timeout=0.5,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
@@ -716,19 +729,46 @@ def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
             # Linux: ... LISTEN 1234/python
             match = re.search(r"\b(\d+)/(?:\S+)", line)
             if match:
-                pids.add(int(match.group(1)))
+                pid = int(match.group(1))
+                if pid > 1:
+                    pids.add(pid)
                 continue
-            # macOS netstat -anv: pid is often near the end as an integer column.
-            parts = line.split()
-            for token in reversed(parts):
-                if token.isdigit():
-                    value = int(token)
-                    if value > 0:
-                        pids.add(value)
-                        break
+            # macOS netstat -anv: pid is a dedicated column near the end.
+            # Prefer the token immediately after LISTEN-related state fields
+            # when present; never treat the port number itself as a PID.
+            pid = _macos_netstat_pid(line, target)
+            if pid is not None and pid > 1:
+                pids.add(pid)
         if pids:
             return sorted(pids)
     return sorted(pids)
+
+
+def _macos_netstat_pid(line: str, port: int) -> Optional[int]:
+    """
+    Extract the process id from a macOS ``netstat -anv -p tcp`` LISTEN row.
+
+    Columns vary by OS version; scanning digits from the right can pick up
+    queue sizes or the port itself. Prefer ``pid/name`` never applies here —
+    reject the listen port value and prefer the rightmost plausible pid.
+    """
+
+    parts = line.split()
+    candidates: list[int] = []
+    for token in parts:
+        if not token.isdigit():
+            continue
+        value = int(token)
+        if value <= 1 or value == int(port):
+            continue
+        # Ephemeral-looking / typical PID range; exclude common watermarks.
+        if value in {131072, 65536, 32768, 16384}:
+            continue
+        candidates.append(value)
+    if not candidates:
+        return None
+    # On modern macOS -anv, pid is usually the rightmost non-flag integer.
+    return candidates[-1]
 
 
 def _netstat_token_has_port(token: str, port: int) -> bool:

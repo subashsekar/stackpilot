@@ -161,13 +161,17 @@ def test_process_checker_dead_is_unhealthy() -> None:
 
 
 def test_health_timeout_raises() -> None:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = int(probe.getsockname()[1])
+    probe.close()
     with pytest.raises(HealthCheckTimeout) as exc:
         Health.wait_until_healthy(
             "auth",
             {
                 "type": "tcp",
                 "host": "127.0.0.1",
-                "port": 1,
+                "port": closed_port,
                 "interval": 0.05,
                 "timeout": 0.25,
             },
@@ -308,6 +312,14 @@ def test_runner_aborts_on_health_timeout_and_stops_started(
         lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
     )
 
+    # Use a just-released ephemeral port — never hardcode port 1.
+    # On macOS CI, launchd/PID 1 is often reported as owning TCP/1, which
+    # raises PortOwnershipError instead of the health-timeout path.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = int(probe.getsockname()[1])
+    probe.close()
+
     marker = tmp_path / "dependent_started"
     stack = Stack()
     stack.service(
@@ -317,7 +329,7 @@ def test_runner_aborts_on_health_timeout_and_stops_started(
         health_check={
             "type": "tcp",
             "host": "127.0.0.1",
-            "port": 1,
+            "port": closed_port,
             "interval": 0.05,
             "timeout": 0.3,
         },

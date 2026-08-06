@@ -338,3 +338,15 @@ def test_netstat_token_has_exact_port_only() -> None:
     assert not port_detect._netstat_token_has_port("0.0.0.0:8080", 80)
     assert port_detect._netstat_token_has_port("127.0.0.1.8000", 8000)
     assert not port_detect._netstat_token_has_port("127.0.0.1.8000", 80)
+
+
+def test_macos_netstat_pid_ignores_port_and_watermarks() -> None:
+    line = (
+        "tcp4 0 0 127.0.0.1.8000 *.* LISTEN "
+        "131072 131072 4242 0 0x0000 0x0000"
+    )
+    assert port_detect._macos_netstat_pid(line, 8000) == 4242
+    # Port number and watermark ints must not be treated as PIDs.
+    assert port_detect._macos_netstat_pid(
+        "tcp4 0 0 *.1 *.* LISTEN 131072 1", 1
+    ) is None

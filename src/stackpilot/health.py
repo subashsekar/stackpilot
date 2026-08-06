@@ -89,39 +89,31 @@ class Health:
         deadline = started + timeout_s
 
         while True:
-            ownership = cls._check_port_ownership(cfg, process=process)
-            if ownership is False:
-                port = cls._configured_port(cfg)
-                raise PortOwnershipError(name, int(port or 0))
-
             # Fail fast when the child already exited — waiting out the full
             # health timeout only delays diagnostics and does not help.
             if process is not None:
                 if process.pid is None or process.poll() is not None:
                     raise HealthCheckTimeout(name)
 
-            # When ownership is None (nothing detected listening yet, or
-            # listener PID mapping unavailable), still probe HTTP/TCP.
-            # Connection refused keeps us waiting; a foreign owner that
-            # detection *can* see is rejected above as False. Skipping
-            # probes on None previously starved readiness on CI hosts
-            # where /proc|ss|lsof briefly miss a just-bound socket.
-
+            # Probe first. Port→PID backends (lsof/netstat) can take hundreds of
+            # ms–seconds on macOS CI; gating probes on ownership previously
+            # starved readiness within short health timeouts.
             if cls.dispatch(cfg, process=process):
-                # Re-verify ownership after a successful probe so a race with
-                # a foreign binder cannot slip through as healthy.
                 ownership_after = cls._check_port_ownership(cfg, process=process)
                 if ownership_after is False:
                     port = cls._configured_port(cfg)
                     raise PortOwnershipError(name, int(port or 0))
-                if ownership_after is True or not cls._requires_port_ownership(cfg):
-                    return clock() - started
-                # Probe succeeded and no foreign owner was confirmed
-                # (ownership_after is None). Accept healthy: requiring a
-                # positive ownership map here leaves services stuck when
-                # port→PID backends are unavailable, even though the
-                # endpoint already answered.
+                # True: our tree owns the port. None: mapping unavailable but
+                # the endpoint already answered — accept healthy.
                 return clock() - started
+
+            # Probe failed: still reject when a foreign listener is confirmed
+            # so we do not spin on someone else's closed/unready socket.
+            ownership = cls._check_port_ownership(cfg, process=process)
+            if ownership is False:
+                port = cls._configured_port(cfg)
+                raise PortOwnershipError(name, int(port or 0))
+
             if cls.timeout(deadline, clock=clock):
                 raise HealthCheckTimeout(name)
             cls.retry(interval, sleep=sleep)
