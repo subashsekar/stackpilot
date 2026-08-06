@@ -350,3 +350,41 @@ def test_macos_netstat_pid_ignores_port_and_watermarks() -> None:
     assert port_detect._macos_netstat_pid(
         "tcp4 0 0 *.1 *.* LISTEN 131072 1", 1
     ) is None
+
+
+def test_pid_tree_owns_port_prefers_positive_tree_listen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS can mis-attribute port→PID; trust tree listen before foreign."""
+
+    monkeypatch.setattr(
+        port_detect,
+        "pids_listening_on_port",
+        lambda _port: [99999],  # wrong owner from system tools
+    )
+    monkeypatch.setattr(
+        port_detect,
+        "listening_ports_for_pid",
+        lambda pid: [18080] if int(pid) == 4242 else [],
+    )
+    monkeypatch.setattr(port_detect, "_process_tree_pids", lambda pid: {int(pid)})
+    monkeypatch.setattr(port_detect, "_ancestor_pids", lambda _pid: set())
+    assert port_detect.pid_tree_owns_port(4242, 18080) is True
+
+
+def test_pid_tree_owns_port_still_rejects_confirmed_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        port_detect,
+        "pids_listening_on_port",
+        lambda _port: [99999],
+    )
+    monkeypatch.setattr(
+        port_detect,
+        "listening_ports_for_pid",
+        lambda _pid: [],  # our tree does not listen
+    )
+    monkeypatch.setattr(port_detect, "_process_tree_pids", lambda pid: {int(pid)})
+    monkeypatch.setattr(port_detect, "_ancestor_pids", lambda _pid: set())
+    assert port_detect.pid_tree_owns_port(4242, 18080) is False
