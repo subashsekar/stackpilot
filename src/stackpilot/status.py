@@ -903,7 +903,47 @@ def pid_is_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+    # Zombies still answer kill(pid, 0). After stop/SIGKILL the child is dead
+    # for orchestration purposes even if a parent has not wait()ed yet — Ubuntu
+    # CI was reporting "PIDs remain alive" for exactly that case.
+    if _posix_pid_is_zombie(int(pid)):
+        return False
     return True
+
+
+def _posix_pid_is_zombie(pid: int) -> bool:
+    """Best-effort zombie detection (Linux ``/proc``, else ``ps``)."""
+
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+                text = handle.read()
+            # pid (comm) state ... — comm may contain spaces/parens.
+            rparen = text.rfind(")")
+            if rparen < 0:
+                return False
+            state = text[rparen + 1 :].lstrip().split(None, 1)[0]
+            return state == "Z"
+        except OSError:
+            return False
+
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=0.5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    state = (completed.stdout or "").strip().upper()
+    return state.startswith("Z")
 
 
 def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:

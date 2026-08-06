@@ -621,6 +621,26 @@ class TestProcessCleanup:
             runner.unbind()
             logger.close()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX zombie semantics")
+    def test_pid_is_alive_false_for_zombie(self) -> None:
+        """SIGKILL'd children stay as zombies until wait(); stop must treat them dead."""
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+        assert proc.pid is not None
+        try:
+            os.kill(proc.pid, 9)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and pid_is_alive(proc.pid):
+                time.sleep(0.05)
+            assert not pid_is_alive(proc.pid)
+        finally:
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
     def test_runtime_json_cleaned_by_stop_session(self, tmp_path: Path) -> None:
         # Intentionally omit start_new_session so the child shares this
         # process group — stop_runtime_session must still terminate only

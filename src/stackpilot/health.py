@@ -95,9 +95,10 @@ class Health:
                 if process.pid is None or process.poll() is not None:
                     raise HealthCheckTimeout(name)
 
-            # Probe first. Port→PID backends (lsof/netstat) can take hundreds of
-            # ms–seconds on macOS CI; gating probes on ownership previously
-            # starved readiness within short health timeouts.
+            # Probe first and only. Port→PID backends (lsof/netstat) are slow on
+            # macOS CI; running them on every connection-refused tick starved
+            # readiness inside short health windows. Foreign listeners are still
+            # rejected after a *successful* probe via ownership_after is False.
             if cls.dispatch(cfg, process=process):
                 ownership_after = cls._check_port_ownership(cfg, process=process)
                 if ownership_after is False:
@@ -106,13 +107,6 @@ class Health:
                 # True: our tree owns the port. None: mapping unavailable but
                 # the endpoint already answered — accept healthy.
                 return clock() - started
-
-            # Probe failed: still reject when a foreign listener is confirmed
-            # so we do not spin on someone else's closed/unready socket.
-            ownership = cls._check_port_ownership(cfg, process=process)
-            if ownership is False:
-                port = cls._configured_port(cfg)
-                raise PortOwnershipError(name, int(port or 0))
 
             if cls.timeout(deadline, clock=clock):
                 raise HealthCheckTimeout(name)

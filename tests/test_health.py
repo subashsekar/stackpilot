@@ -215,6 +215,24 @@ def test_http_healthy_when_port_ownership_unknown(
         stop.set()
 
 
+def test_http_checker_ignores_env_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local health probes must not follow HTTP_PROXY (macOS/Linux CI footgun)."""
+
+    stop = threading.Event()
+    try:
+        base = _serve_http_until(ready_after_s=0.0, stop=stop)
+        url = f"{base}/health"
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+        assert check_http(url, request_timeout=1.0) is True
+    finally:
+        stop.set()
+
+
 def test_dispatch_unknown_type_raises() -> None:
     with pytest.raises(HealthCheckError, match="Unknown health check type"):
         Health.dispatch({"type": "magic"})
@@ -253,7 +271,7 @@ def test_runner_waits_for_http_before_dependent(
         "print('api up', flush=True)\n"
         "srv = HTTPServer(('127.0.0.1', PORT), H)\n"
         "srv.timeout = 0.5\n"
-        "deadline = time.time() + 4.0\n"
+        "deadline = time.time() + 12.0\n"
         "while time.time() < deadline:\n"
         "    srv.handle_request()\n",
         encoding="utf-8",
@@ -269,6 +287,7 @@ def test_runner_waits_for_http_before_dependent(
             "url": url,
             "interval": 0.1,
             "timeout": 8,
+            "probe_timeout": 0.5,
         },
     )
     stack.service(

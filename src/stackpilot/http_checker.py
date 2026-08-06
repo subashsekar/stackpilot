@@ -6,11 +6,16 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .config import HttpHealthCheck
 
 ALLOWED_HTTP_SCHEMES = frozenset({"http", "https"})
+
+# Health probes must never inherit HTTP(S)_PROXY from the environment —
+# macOS/Linux CI runners sometimes set a proxy that black-holes 127.0.0.1
+# and burns the full probe_timeout on every attempt.
+_NO_PROXY_OPENER = build_opener(ProxyHandler({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +74,7 @@ def probe_http(url: str, *, request_timeout: float = 2.0) -> HttpProbeResult:
 
     request = Request(text, method="GET")
     try:
-        with urlopen(request, timeout=request_timeout) as response:
+        with _NO_PROXY_OPENER.open(request, timeout=request_timeout) as response:
             code = int(response.status)
             return _from_status(code)
     except HTTPError as exc:
