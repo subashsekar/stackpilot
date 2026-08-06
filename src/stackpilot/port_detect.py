@@ -613,14 +613,18 @@ def _pids_listening_on_port_psutil(port: int) -> List[int]:
 
 
 def _pids_listening_on_port_lsof(port: int) -> List[int]:
-    completed = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
     pids: set[int] = set()
     if completed.returncode != 0 or not completed.stdout:
         return []
@@ -638,33 +642,35 @@ def _pids_listening_on_port_lsof(port: int) -> List[int]:
 def _pids_listening_on_port_ss(port: int) -> List[int]:
     """Parse ``ss -lptn`` listeners (Linux; often available when lsof is not)."""
 
-    completed = subprocess.run(
-        ["ss", "-lptn"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["ss", "-lptn"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
     if completed.returncode != 0 or not completed.stdout:
         return []
     pids: set[int] = set()
     # Example: LISTEN 0 128 127.0.0.1:8000 0.0.0.0:* users:(("python",pid=123,fd=3))
-    port_token = f":{int(port)}"
+    target = int(port)
     for line in completed.stdout.splitlines():
         if "LISTEN" not in line.upper():
             continue
         # Local address is typically column 4 in `ss -lptn`.
         parts = line.split()
         local = parts[3] if len(parts) >= 4 else ""
-        if not (
-            local.endswith(port_token)
-            or f"]:{int(port)}" in local
-            or local.endswith(f"]:{int(port)}")
-        ):
-            # Also accept ":PORT" anywhere before the users= blob for IPv6 forms.
+        if _port_from_local_addr(local) != target:
+            # IPv6 / atypical columns: scan tokens before users= only.
             before_users = line.split("users:", 1)[0]
-            if not re.search(rf"[:\]]{int(port)}\b", before_users):
+            if not any(
+                _port_from_local_addr(token) == target for token in before_users.split()
+            ):
                 continue
         for match in re.finditer(r"pid=(\d+)", line):
             try:
@@ -683,24 +689,29 @@ def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
         ["netstat", "-an", "-p", "tcp"],
     )
     pids: set[int] = set()
-    port_suffix = f".{int(port)}"  # macOS often uses *.8000 / 127.0.0.1.8000
-    port_colon = f":{int(port)}"
+    target = int(port)
     for argv in candidates:
-        completed = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=2.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
         if not completed.stdout:
             continue
         for line in completed.stdout.splitlines():
             upper = line.upper()
             if "LISTEN" not in upper:
                 continue
-            if port_colon not in line and port_suffix not in line:
+            # Exact host:port / host.port match only — never substring
+            # (":1" must not match ":1234", ".80" must not match ".8080").
+            if not any(_netstat_token_has_port(token, target) for token in line.split()):
                 continue
             # Linux: ... LISTEN 1234/python
             match = re.search(r"\b(\d+)/(?:\S+)", line)
@@ -718,6 +729,23 @@ def _pids_listening_on_port_netstat_posix(port: int) -> List[int]:
         if pids:
             return sorted(pids)
     return sorted(pids)
+
+
+def _netstat_token_has_port(token: str, port: int) -> bool:
+    """True when a netstat address token refers exactly to ``port``."""
+
+    text = token.strip()
+    if not text:
+        return False
+    parsed = _port_from_local_addr(text)
+    if parsed == int(port):
+        return True
+    # macOS often prints ``*.8000`` / ``127.0.0.1.8000``.
+    if "." in text and ":" not in text:
+        tail = text.rsplit(".", 1)[-1]
+        if tail.isdigit() and int(tail) == int(port):
+            return True
+    return False
 
 
 def _pids_listening_on_port_linux_proc(port: int) -> List[int]:

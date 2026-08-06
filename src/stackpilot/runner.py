@@ -1167,6 +1167,15 @@ class Runner:
             )
             self._status.sync_managed(manager.get(spec.name))
             return False
+        except PortOwnershipError:
+            # Port conflict after reload is a health-gate failure: keep the
+            # same isolation message so dependents are not blamed.
+            _safe_print(
+                f"❌ {spec.name} failed health check after reload",
+                ascii_fallback=f"X {spec.name} failed health check after reload",
+            )
+            self._status.sync_managed(manager.get(spec.name))
+            return False
         except Exception as exc:
             _safe_print(
                 f"❌ {spec.name} reload failed: {exc}",

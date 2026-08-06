@@ -175,6 +175,42 @@ def test_health_timeout_raises() -> None:
     assert exc.value.name == "auth"
 
 
+def test_http_healthy_when_port_ownership_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When listener PID mapping returns None, still accept a successful HTTP probe.
+
+    CI hosts intermittently fail /proc|ss|lsof attribution; skipping probes on
+    None previously caused false health timeouts while the endpoint was up.
+    """
+
+    stop = threading.Event()
+    try:
+        base = _serve_http_until(ready_after_s=0.0, stop=stop)
+        url = f"{base}/health"
+        monkeypatch.setattr(
+            "stackpilot.health.pid_tree_owns_port",
+            lambda *_a, **_k: None,
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        try:
+            elapsed = Health.wait_until_healthy(
+                "api",
+                {"type": "http", "url": url, "interval": 0.05, "timeout": 3},
+                process=proc,
+            )
+            assert elapsed >= 0.0
+            assert check_http(url) is True
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        stop.set()
+
+
 def test_dispatch_unknown_type_raises() -> None:
     with pytest.raises(HealthCheckError, match="Unknown health check type"):
         Health.dispatch({"type": "magic"})

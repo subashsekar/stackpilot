@@ -262,3 +262,79 @@ def test_pids_listening_backends_tolerate_missing_tools(
     monkeypatch.setattr(port_detect, "_pids_listening_on_port_ss", boom)
     monkeypatch.setattr(port_detect, "_pids_listening_on_port_netstat_posix", boom)
     assert port_detect._pids_listening_on_port_posix(18080) == []
+
+
+def test_ss_parser_rejects_port_number_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``:1`` must not match ``:1234`` / ``]:18080`` (CI false foreign owners)."""
+
+    import subprocess
+
+    sample = (
+        "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+        "LISTEN 0 128 127.0.0.1:1234 0.0.0.0:* users:((\"python\",pid=111,fd=3))\n"
+        "LISTEN 0 128 [::]:18080 [::]:* users:((\"node\",pid=222,fd=4))\n"
+        "LISTEN 0 128 127.0.0.1:1 0.0.0.0:* users:((\"sshd\",pid=333,fd=5))\n"
+    )
+
+    class _Completed:
+        returncode = 0
+        stdout = sample
+
+    original = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "ss":
+            return _Completed()
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert port_detect._pids_listening_on_port_ss(1) == [333]
+    assert port_detect._pids_listening_on_port_ss(1234) == [111]
+    assert port_detect._pids_listening_on_port_ss(18080) == [222]
+    assert port_detect._pids_listening_on_port_ss(8) == []
+    assert port_detect._pids_listening_on_port_ss(80) == []
+
+
+def test_netstat_parser_rejects_port_number_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Substring ``:1`` / ``.80`` must not claim unrelated LISTEN rows."""
+
+    import subprocess
+
+    sample = (
+        "Proto Recv-Q Send-Q Local Address Foreign Address State PID/Program\n"
+        "tcp 0 0 127.0.0.1:1234 0.0.0.0:* LISTEN 111/python\n"
+        "tcp 0 0 0.0.0.0:8080 0.0.0.0:* LISTEN 222/node\n"
+        "tcp 0 0 127.0.0.1:1 0.0.0.0:* LISTEN 333/sshd\n"
+        "tcp4 0 0 127.0.0.1.8000 *.* LISTEN 444\n"
+    )
+
+    class _Completed:
+        returncode = 0
+        stdout = sample
+
+    original = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "netstat":
+            return _Completed()
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert port_detect._pids_listening_on_port_netstat_posix(1) == [333]
+    assert port_detect._pids_listening_on_port_netstat_posix(1234) == [111]
+    assert port_detect._pids_listening_on_port_netstat_posix(8080) == [222]
+    assert port_detect._pids_listening_on_port_netstat_posix(8000) == [444]
+    assert port_detect._pids_listening_on_port_netstat_posix(8) == []
+    assert port_detect._pids_listening_on_port_netstat_posix(80) == []
+
+
+def test_netstat_token_has_exact_port_only() -> None:
+    assert port_detect._netstat_token_has_port("127.0.0.1:1", 1)
+    assert not port_detect._netstat_token_has_port("127.0.0.1:1234", 1)
+    assert not port_detect._netstat_token_has_port("0.0.0.0:8080", 80)
+    assert port_detect._netstat_token_has_port("127.0.0.1.8000", 8000)
+    assert not port_detect._netstat_token_has_port("127.0.0.1.8000", 80)
